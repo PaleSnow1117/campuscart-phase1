@@ -1,4 +1,6 @@
 import { type FormEvent, type ReactNode, useEffect, useState } from "react";
+import { authService } from "./data/authService";
+import type { User } from "./data/types";
 
 type Route =
   | "welcome"
@@ -202,17 +204,38 @@ function WelcomeScreen({ go }: { go: (route: Route) => void }) {
   </div>;
 }
 
-function AuthScreen({ mode, go }: { mode: "login" | "signup"; go: (route: Route) => void }) {
-  const submit = (event: FormEvent) => { event.preventDefault(); go("home"); };
+function AuthScreen({ mode, go, onAuthenticated }: { mode: "login" | "signup"; go: (route: Route) => void; onAuthenticated: (user: User) => void }) {
+  const [error, setError] = useState("");
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setError("");
+    const fields = new FormData(event.currentTarget);
+    try {
+      const username = String(fields.get("username") ?? "");
+      const password = String(fields.get("password") ?? "");
+      const user = mode === "login"
+        ? authService.login(username, password)
+        : authService.signUp({
+            fullName: String(fields.get("fullName") ?? ""),
+            username,
+            email: String(fields.get("email") ?? ""),
+            password,
+          });
+      onAuthenticated(user);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Unable to save your account. Please try again.");
+    }
+  };
   const login = mode === "login";
   return <div className="screen auth-screen"><Topbar go={go} back="welcome" title={login ? "Login" : "Create account"} /><main className="auth-content"><div className="auth-mark"><Icon name={login ? "profile" : "cart"} size={29} /></div><p className="under-label">{login ? "WELCOME BACK TO CAMPUSCART" : "JOIN YOUR CAMPUS MARKETPLACE"}</p><h2>{login ? "Good to see you again." : "Start finding good things."}</h2><p className="auth-intro">{login ? "Login to continue buying and selling with students nearby." : "Create your account and keep your campus finds close."}</p><form onSubmit={submit}>
-    {!login && <label>Full Name<input required placeholder="Enter your full name" /></label>}
-    <label>Username<input required placeholder="Enter your username" /></label>
-    {!login && <label>Campus Email<input required type="email" placeholder="name@urs.edu.ph" /></label>}
-    <label>Password<input required type="password" placeholder="Enter your password" /></label>
-    {login && <div className="form-options"><label className="check-label"><input type="checkbox" /> <span>Remember Me</span></label><button type="button">Forgot Password?</button></div>}
+    {!login && <label>Full Name<input required name="fullName" placeholder="Enter your full name" /></label>}
+    <label>Username<input required name="username" placeholder="Enter your username" /></label>
+    {!login && <label>Campus Email<input required name="email" type="email" placeholder="name@urs.edu.ph" /></label>}
+    <label>Password<input required name="password" type="password" placeholder="Enter your password" /></label>
+    {login && <div className="form-options"><label className="check-label"><input type="checkbox" /> <span>Remember Me</span></label><button type="button" onClick={() => setError("Password recovery is not available for local accounts.")}>Forgot Password?</button></div>}
+    {error && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11 }}>{error}</p>}
     <button className="primary-button wide" type="submit">{login ? "Login" : "Sign up"} <Icon name="arrow" size={17} /></button>
-  </form>{login && <div className="continue"><span>Continue With</span><button type="button" onClick={() => go("home")}>G&nbsp;&nbsp; Google</button></div>}<p className="account-prompt">{login ? "Don't Have An Account? " : "Already have an account? "}<button type="button" onClick={() => go(login ? "signup" : "login")}>{login ? "Sign up" : "Login"}</button></p></main></div>;
+  </form>{login && <div className="continue"><span>Continue With</span><button type="button" onClick={() => setError("Google login is not available for local accounts.")}>G&nbsp;&nbsp; Google</button></div>}<p className="account-prompt">{login ? "Don't Have An Account? " : "Already have an account? "}<button type="button" onClick={() => go(login ? "signup" : "login")}>{login ? "Sign up" : "Login"}</button></p></main></div>;
 }
 
 function ProductScreen({ go, saved, toggleSaved }: { go: (route: Route) => void; saved: number[]; toggleSaved: (id: number) => void }) {
@@ -239,9 +262,10 @@ function ChatScreen({ go }: { go: (route: Route) => void }) {
   return <div className="screen chat-screen"><header className="chat-header"><button className="icon-button" onClick={() => go("messages")} type="button"><Icon name="back" /></button><span className="seller-avatar">BR</span><div><strong>Balmond R.</strong><small>Active now</small></div></header><div className="chat-item"><ProductArt kind="uniform" /><div><small>ABOUT THIS ITEM</small><strong>URS P.E UNIFORM</strong><span>₱1M</span></div></div><main className="bubbles"><span className="day-label">TODAY</span>{messages.map((message, index) => <div key={message.id} className={`bubble ${message.mine ? "mine" : "theirs"}`}>{message.text}<small>{index === messages.length - 1 ? "10:42" : "10:40"}</small></div>)}</main><form className="message-form" onSubmit={send}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Write a message..." aria-label="Message" /><button type="submit" aria-label="Send"><Icon name="send" size={18} /></button></form></div>;
 }
 
-function ProfileScreen({ go }: { go: (route: Route) => void }) {
+function ProfileScreen({ go, user, onLogout }: { go: (route: Route) => void; user: User; onLogout: () => void }) {
   const rows: { label: string; icon: IconName; route?: Route }[] = [{ label: "My listings", icon: "uniform" }, { label: "Saved items", icon: "heart", route: "saved" }, { label: "Campus & account", icon: "location" }, { label: "Help and safety", icon: "shield" }];
-  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content profile-content"><p className="section-kicker">YOUR CAMPUSCART</p><h1>Profile.</h1><div className="profile-card"><span className="profile-avatar">BR</span><div><h2>Balmond R.</h2><p><Icon name="location" size={12} /> URS Binangonan</p><span><Icon name="check" size={11} /> Student verified</span></div></div><button className="primary-button list-button" onClick={() => go("create")} type="button"><Icon name="plus" /> List an item</button><div className="profile-menu">{rows.map((row) => <button key={row.label} onClick={() => row.route && go(row.route)} type="button"><span><Icon name={row.icon} size={19} /></span>{row.label}<Icon name="chevron" size={17} /></button>)}</div><button className="logout" type="button" onClick={() => go("welcome")}>Log out</button></main><BottomNav current="profile" go={go} /></div>;
+  const initials = user.fullName.trim().split(/\s+/).slice(0, 2).map((part) => part[0].toUpperCase()).join("");
+  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content profile-content"><p className="section-kicker">YOUR CAMPUSCART</p><h1>Profile.</h1><div className="profile-card"><span className="profile-avatar">{initials}</span><div><h2>{user.fullName}</h2><p><Icon name="location" size={12} /> {user.campus}</p><span><Icon name="check" size={11} /> Campus account</span></div></div><button className="primary-button list-button" onClick={() => go("create")} type="button"><Icon name="plus" /> List an item</button><div className="profile-menu">{rows.map((row) => <button key={row.label} onClick={() => row.route && go(row.route)} type="button"><span><Icon name={row.icon} size={19} /></span>{row.label}<Icon name="chevron" size={17} /></button>)}</div><button className="logout" type="button" onClick={onLogout}>Log out</button></main><BottomNav current="profile" go={go} /></div>;
 }
 
 function CreateScreen({ go }: { go: (route: Route) => void }) {
@@ -252,13 +276,37 @@ function CreateScreen({ go }: { go: (route: Route) => void }) {
 }
 
 function App() {
-  const [route, setRoute] = useState<Route>(() => pathToRoute[window.location.pathname] ?? "home");
+  const [user, setUser] = useState<User | null>(() => authService.getCurrentUser());
+  const [route, setRoute] = useState<Route>(() => {
+    const requested = pathToRoute[window.location.pathname] ?? "home";
+    return requested === "profile" && !authService.getCurrentUser() ? "login" : requested;
+  });
   const [saved, setSaved] = useState<number[]>([2]);
-  useEffect(() => { const onPop = () => setRoute(pathToRoute[window.location.pathname] ?? "home"); window.addEventListener("popstate", onPop); return () => window.removeEventListener("popstate", onPop); }, []);
-  const go = (next: Route) => { window.history.pushState({}, "", routeToPath[next]); setRoute(next); window.scrollTo(0, 0); };
+  useEffect(() => {
+    const onPop = () => {
+      const requested = pathToRoute[window.location.pathname] ?? "home";
+      setRoute(requested === "profile" && !authService.getCurrentUser() ? "login" : requested);
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+  const go = (next: Route) => {
+    const destination = next === "profile" && !user ? "login" : next;
+    window.history.pushState({}, "", routeToPath[destination]);
+    setRoute(destination);
+    window.scrollTo(0, 0);
+  };
+  const onAuthenticated = (account: User) => { setUser(account); go("home"); };
+  const onLogout = () => {
+    authService.logout();
+    setUser(null);
+    window.history.replaceState({}, "", routeToPath.welcome);
+    setRoute("welcome");
+    window.scrollTo(0, 0);
+  };
   const toggleSaved = (id: number) => setSaved((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
   const screens: Record<Route, ReactNode> = {
-    welcome: <WelcomeScreen go={go} />, home: <HomeScreen go={go} saved={saved} toggleSaved={toggleSaved} />, login: <AuthScreen mode="login" go={go} />, signup: <AuthScreen mode="signup" go={go} />, product: <ProductScreen go={go} saved={saved} toggleSaved={toggleSaved} />, saved: <SavedScreen go={go} saved={saved} toggleSaved={toggleSaved} />, messages: <MessagesScreen go={go} />, chat: <ChatScreen go={go} />, profile: <ProfileScreen go={go} />, create: <CreateScreen go={go} />,
+    welcome: <WelcomeScreen go={go} />, home: <HomeScreen go={go} saved={saved} toggleSaved={toggleSaved} />, login: <AuthScreen key="login" mode="login" go={go} onAuthenticated={onAuthenticated} />, signup: <AuthScreen key="signup" mode="signup" go={go} onAuthenticated={onAuthenticated} />, product: <ProductScreen go={go} saved={saved} toggleSaved={toggleSaved} />, saved: <SavedScreen go={go} saved={saved} toggleSaved={toggleSaved} />, messages: <MessagesScreen go={go} />, chat: <ChatScreen go={go} />, profile: user ? <ProfileScreen go={go} user={user} onLogout={onLogout} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, create: <CreateScreen go={go} />,
   };
   return <div className="app-shell">{screens[route]}</div>;
 }
