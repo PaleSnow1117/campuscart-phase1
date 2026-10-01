@@ -1,6 +1,8 @@
-import { type FormEvent, type ReactNode, useEffect, useState } from "react";
+import { type ChangeEvent, type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import { authService } from "./data/authService";
-import type { User } from "./data/types";
+import { imageService, MAX_IMAGES } from "./data/imageService";
+import { artKind, formatPostedAt, formatPrice, listingService, parsePrice, savedService } from "./data/listingService";
+import { LISTING_CATEGORIES, LISTING_CONDITIONS, type Listing, type ListingCategory, type ListingCondition, type User } from "./data/types";
 
 type Route =
   | "welcome"
@@ -55,6 +57,12 @@ const routeToPath: Record<Route, string> = Object.fromEntries(
   Object.entries(pathToRoute).map(([path, route]) => [route, path]),
 ) as Record<Route, string>;
 
+type GoFn = (route: Route, listingId?: string) => void;
+
+// Screens that need a signed-in user (profile as in Phase 1; create needs a seller ID).
+const protectedRoutes: Route[] = ["profile", "create"];
+const guard = (route: Route, user: User | null): Route => (protectedRoutes.includes(route) && !user ? "login" : route);
+
 function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, ReactNode> = {
     arrow: <><path d="M5 12h13M13 7l5 5-5 5" /></>,
@@ -91,7 +99,7 @@ function Logo({ onClick }: { onClick?: () => void }) {
   );
 }
 
-function Topbar({ go, back, title }: { go: (route: Route) => void; back?: Route; title?: string }) {
+function Topbar({ go, back, title }: { go: GoFn; back?: Route; title?: string }) {
   if (back) {
     return <header className="sub-header"><button className="icon-button" onClick={() => go(back)} type="button" aria-label="Back"><Icon name="back" /></button><h1>{title}</h1><span className="header-spacer" /></header>;
   }
@@ -113,47 +121,27 @@ function BottomNav({ current, go }: { current: Route; go: (route: Route) => void
   );
 }
 
-const listings = [
-  { id: 1, title: "URS P.E UNIFORM", condition: "Good as new", price: "₱1M", seller: "Balmond R.", kind: "uniform" },
-  { id: 2, title: "CALCULUS BOOK", condition: "Good as new", price: "₱250", seller: "Miya S.", kind: "book" },
-  { id: 3, title: "DRAFTING SET", condition: "Lightly used", price: "₱180", seller: "Clint M.", kind: "tools" },
-];
-
-function ProductArt({ kind, large = false }: { kind: string; large?: boolean }) {
+function ProductArt({ kind, large = false, image }: { kind: string; large?: boolean; image?: string }) {
+  if (image) return <div className={`product-art ${large ? "large" : ""} art-${kind}`}><img src={image} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", zIndex: 0, pointerEvents: "none" }} /></div>;
   return <div className={`product-art ${large ? "large" : ""} art-${kind}`}><span className="art-label">URS</span><Icon name={kind === "book" ? "book" : kind === "uniform" ? "uniform" : "plus"} size={large ? 92 : 54} /></div>;
 }
 
-function ListingCard({ listing, saved, toggleSaved, go }: { listing: typeof listings[number]; saved: boolean; toggleSaved: (id: number) => void; go: (route: Route) => void }) {
+function ListingCard({ listing, saved, toggleSaved, go }: { listing: Listing; saved: boolean; toggleSaved: (id: string) => void; go: GoFn }) {
   return (
     <article className="listing-card">
-      <button className="card-image" type="button" onClick={() => go("product")}><ProductArt kind={listing.kind} /></button>
+      <button className="card-image" type="button" onClick={() => go("product", listing.id)}><ProductArt kind={artKind(listing.category)} image={listing.images[0]} /></button>
       <button className={`save-button ${saved ? "is-saved" : ""}`} type="button" aria-label="Save item" onClick={() => toggleSaved(listing.id)}><Icon name="heart" size={19} /></button>
-      <button className="listing-info" type="button" onClick={() => go("product")}>
-        <small>{listing.condition}</small><h3>{listing.title}</h3><strong>{listing.price}</strong><p>From {listing.seller}</p>
+      <button className="listing-info" type="button" onClick={() => go("product", listing.id)}>
+        <small>{listing.condition}</small><h3>{listing.title}</h3><strong>{formatPrice(listing.price)}</strong><p>From {listing.sellerName}</p>
       </button>
     </article>
   );
 }
 
-function HomeScreen({ go, saved, toggleSaved }: { go: (route: Route) => void; saved: number[]; toggleSaved: (id: number) => void }) {
-  const [category, setCategory] = useState("All");
+function HomeScreen({ go, listings, saved, toggleSaved }: { go: GoFn; listings: Listing[]; saved: string[]; toggleSaved: (id: string) => void }) {
+  const [category, setCategory] = useState<ListingCategory | "All">("All");
   const [search, setSearch] = useState("");
-  const filteredListings = listings.filter((listing) => {
-    const matchesCategory =
-      category === "All" ||
-      (category === "Books" && listing.kind === "book") ||
-      (category === "Uniforms" && listing.kind === "uniform");
-
-    const query = search.toLowerCase().trim();
-
-    const matchesSearch =
-      !query ||
-      listing.title.toLowerCase().includes(query) ||
-      listing.condition.toLowerCase().includes(query) ||
-      listing.seller.toLowerCase().includes(query);
-
-    return matchesCategory && matchesSearch;
-  });
+  const filteredListings = listingService.filter(listings, { category, query: search });
 
   return <div className="screen main-screen">
     <Topbar go={go} />
@@ -182,7 +170,7 @@ function HomeScreen({ go, saved, toggleSaved }: { go: (route: Route) => void; sa
         </label>
 
         <div className="category-row">
-          {["All", "Books", "Uniforms", "Food"].map((item) => <button className={category === item ? "selected" : ""} key={item} type="button" onClick={() => setCategory(item)}>{item}</button>)}
+          {(["All", "Books", "Uniforms", "Food"] as const).map((item) => <button className={category === item ? "selected" : ""} key={item} type="button" onClick={() => setCategory(item)}>{item}</button>)}
         </div>
 
         <div className="listing-grid">
@@ -238,12 +226,16 @@ function AuthScreen({ mode, go, onAuthenticated }: { mode: "login" | "signup"; g
   </form>{login && <div className="continue"><span>Continue With</span><button type="button" onClick={() => setError("Google login is not available for local accounts.")}>G&nbsp;&nbsp; Google</button></div>}<p className="account-prompt">{login ? "Don't Have An Account? " : "Already have an account? "}<button type="button" onClick={() => go(login ? "signup" : "login")}>{login ? "Sign up" : "Login"}</button></p></main></div>;
 }
 
-function ProductScreen({ go, saved, toggleSaved }: { go: (route: Route) => void; saved: number[]; toggleSaved: (id: number) => void }) {
-  const item = listings[0];
-  return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main><div className="detail-art"><ProductArt kind="uniform" large /><button className={`save-button detail-save ${saved.includes(1) ? "is-saved" : ""}`} type="button" onClick={() => toggleSaved(1)}><Icon name="heart" /></button><span className="photo-count">1 / 3</span></div><div className="detail-info"><div className="condition-row"><span>Good as new</span><small>Posted today</small></div><h2>{item.title}</h2><strong className="detail-price">{item.price}</strong><div className="seller-box"><span className="seller-avatar">BR</span><div><small>SELLER</small><strong>Balmond R.</strong><p><Icon name="location" size={12} /> URS Binangonan Campus</p></div><Icon name="chevron" /></div><h3>About this item</h3><p className="description">Complete URS P.E uniform in excellent condition. Clean, comfortable, and ready to use. Meet-up inside campus preferred.</p><div className="safety-note"><Icon name="shield" /><p><strong>Buy safely on campus</strong><br />Meet in a public campus area and inspect the item before paying.</p></div></div></main><div className="detail-actions"><button className="outline-button" type="button" onClick={() => toggleSaved(1)}><Icon name="heart" size={18} /> Save</button><button className="primary-button" type="button" onClick={() => go("chat")}><Icon name="chat" size={18} /> Message seller</button></div></div>;
+function ProductScreen({ go, item, saved, toggleSaved }: { go: GoFn; item?: Listing; saved: string[]; toggleSaved: (id: string) => void }) {
+  const [photo, setPhoto] = useState(0);
+  if (!item) return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main className="page-content"><div className="empty-state"><span><Icon name="search" size={33} /></span><h2>Listing not found</h2><p>This item may have been removed.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div></main></div>;
+  const isSaved = saved.includes(item.id);
+  const photos = item.images.length;
+  const initials = item.sellerName.split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("");
+  return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main><div className="detail-art" onClick={() => photos > 1 && setPhoto((photo + 1) % photos)}><ProductArt kind={artKind(item.category)} image={item.images[photo % Math.max(photos, 1)]} large /><button className={`save-button detail-save ${isSaved ? "is-saved" : ""}`} type="button" onClick={(event) => { event.stopPropagation(); toggleSaved(item.id); }}><Icon name="heart" /></button><span className="photo-count">{(photo % Math.max(photos, 1)) + 1} / {Math.max(photos, 1)}</span></div><div className="detail-info"><div className="condition-row"><span>{item.condition}</span><small>{formatPostedAt(item.createdAt)}</small></div><h2>{item.title}</h2><strong className="detail-price">{formatPrice(item.price)}</strong><div className="seller-box"><span className="seller-avatar">{initials}</span><div><small>SELLER</small><strong>{item.sellerName}</strong><p><Icon name="location" size={12} /> {item.campus} Campus</p></div><Icon name="chevron" /></div><h3>About this item</h3><p className="description">{item.description}</p><div className="safety-note"><Icon name="shield" /><p><strong>Buy safely on campus</strong><br />Meet in a public campus area and inspect the item before paying.</p></div></div></main><div className="detail-actions"><button className="outline-button" type="button" onClick={() => toggleSaved(item.id)}><Icon name="heart" size={18} /> Save</button><button className="primary-button" type="button" onClick={() => go("chat")}><Icon name="chat" size={18} /> Message seller</button></div></div>;
 }
 
-function SavedScreen({ go, saved, toggleSaved }: { go: (route: Route) => void; saved: number[]; toggleSaved: (id: number) => void }) {
+function SavedScreen({ go, listings, saved, toggleSaved }: { go: GoFn; listings: Listing[]; saved: string[]; toggleSaved: (id: string) => void }) {
   const items = listings.filter((item) => saved.includes(item.id));
   return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content"><p className="section-kicker">YOUR SHORTLIST</p><h1>Saved <em>finds.</em></h1>{items.length ? <div className="listing-grid saved-grid">{items.map((listing) => <ListingCard key={listing.id} listing={listing} saved toggleSaved={toggleSaved} go={go} />)}</div> : <div className="empty-state"><span><Icon name="heart" size={33} /></span><h2>No saved finds yet</h2><p>Tap the heart on anything you want to come back to.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div>}</main><BottomNav current="saved" go={go} /></div>;
 }
@@ -268,45 +260,86 @@ function ProfileScreen({ go, user, onLogout }: { go: (route: Route) => void; use
   return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content profile-content"><p className="section-kicker">YOUR CAMPUSCART</p><h1>Profile.</h1><div className="profile-card"><span className="profile-avatar">{initials}</span><div><h2>{user.fullName}</h2><p><Icon name="location" size={12} /> {user.campus}</p><span><Icon name="check" size={11} /> Campus account</span></div></div><button className="primary-button list-button" onClick={() => go("create")} type="button"><Icon name="plus" /> List an item</button><div className="profile-menu">{rows.map((row) => <button key={row.label} onClick={() => row.route && go(row.route)} type="button"><span><Icon name={row.icon} size={19} /></span>{row.label}<Icon name="chevron" size={17} /></button>)}</div><button className="logout" type="button" onClick={onLogout}>Log out</button></main><BottomNav current="profile" go={go} /></div>;
 }
 
-function CreateScreen({ go }: { go: (route: Route) => void }) {
+function CreateScreen({ go, onPublish }: { go: GoFn; onPublish: (input: { title: string; price: number; condition: ListingCondition; category: ListingCategory; description: string; images: string[] }) => void }) {
   const [done, setDone] = useState(false);
-  const submit = (event: FormEvent) => { event.preventDefault(); setDone(true); };
+  const [error, setError] = useState("");
+  const [images, setImages] = useState<string[]>([]);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const pickPhotos = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files?.length) return;
+    setError("");
+    try {
+      const added = await imageService.processFiles(files, MAX_IMAGES - images.length);
+      setImages((current) => [...current, ...added].slice(0, MAX_IMAGES));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not add those photos.");
+    }
+    event.target.value = "";
+  };
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setError("");
+    const fields = new FormData(event.currentTarget);
+    const price = parsePrice(String(fields.get("price") ?? ""));
+    if (price === null) { setError("Please enter a valid price, e.g. 250."); return; }
+    try {
+      onPublish({
+        title: String(fields.get("title") ?? ""),
+        price,
+        condition: String(fields.get("condition")) as ListingCondition,
+        category: String(fields.get("category")) as ListingCategory,
+        description: String(fields.get("description") ?? ""),
+        images,
+      });
+      setDone(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Unable to publish your listing. Please try again.");
+    }
+  };
   if (done) return <div className="screen success-screen"><span><Icon name="check" size={36} /></span><p className="under-label">LISTING PUBLISHED</p><h1>Your good find is now live.</h1><p>Students nearby can now discover and message you about your item.</p><button className="primary-button wide" type="button" onClick={() => go("home")}>Back to marketplace</button></div>;
-  return <div className="screen create-screen"><Topbar go={go} back="home" title="List an item" /><main className="create-content"><p className="section-kicker">SELL ON CAMPUS</p><h1>Pass on a <em>good thing.</em></h1><form onSubmit={submit}><button className="photo-upload" type="button"><Icon name="camera" size={28} /><strong>Add photos</strong><small>Add up to 5 clear photos</small></button><label>Item title<input required placeholder="What are you selling?" /></label><div className="two-fields"><label>Price<input required placeholder="₱ 0.00" /></label><label>Condition<select defaultValue="Good as new"><option>Good as new</option><option>Brand new</option><option>Lightly used</option></select></label></div><label>Category<select defaultValue="Uniforms"><option>Books</option><option>Uniforms</option><option>Food</option><option>Other</option></select></label><label>Description<textarea required placeholder="Share useful details about your item" /></label><button className="primary-button wide" type="submit">Publish listing <Icon name="arrow" size={17} /></button></form></main></div>;
+  return <div className="screen create-screen"><Topbar go={go} back="home" title="List an item" /><main className="create-content"><p className="section-kicker">SELL ON CAMPUS</p><h1>Pass on a <em>good thing.</em></h1><form onSubmit={submit}><input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={pickPhotos} /><button className="photo-upload" type="button" onClick={() => fileInput.current?.click()}><Icon name="camera" size={28} /><strong>Add photos</strong><small>{images.length ? `${images.length} of ${MAX_IMAGES} photo${images.length > 1 ? "s" : ""} added` : `Add up to ${MAX_IMAGES} clear photos`}</small></button><label>Item title<input required name="title" placeholder="What are you selling?" /></label><div className="two-fields"><label>Price<input required name="price" inputMode="decimal" placeholder="₱ 0.00" /></label><label>Condition<select name="condition" defaultValue="Good as new">{LISTING_CONDITIONS.map((item) => <option key={item}>{item}</option>)}</select></label></div><label>Category<select name="category" defaultValue="Uniforms">{LISTING_CATEGORIES.map((item) => <option key={item}>{item}</option>)}</select></label><label>Description<textarea required name="description" placeholder="Share useful details about your item" /></label>{error && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11 }}>{error}</p>}<button className="primary-button wide" type="submit">Publish listing <Icon name="arrow" size={17} /></button></form></main></div>;
 }
 
 function App() {
   const [user, setUser] = useState<User | null>(() => authService.getCurrentUser());
-  const [route, setRoute] = useState<Route>(() => {
-    const requested = pathToRoute[window.location.pathname] ?? "home";
-    return requested === "profile" && !authService.getCurrentUser() ? "login" : requested;
-  });
-  const [saved, setSaved] = useState<number[]>([2]);
+  const [listings, setListings] = useState<Listing[]>(() => listingService.getAll());
+  const [saved, setSaved] = useState<string[]>(() => savedService.getIds(authService.getCurrentUser()?.id));
+  const [listingId, setListingId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("id"));
+  const [route, setRoute] = useState<Route>(() => guard(pathToRoute[window.location.pathname] ?? "home", authService.getCurrentUser()));
   useEffect(() => {
     const onPop = () => {
-      const requested = pathToRoute[window.location.pathname] ?? "home";
-      setRoute(requested === "profile" && !authService.getCurrentUser() ? "login" : requested);
+      setRoute(guard(pathToRoute[window.location.pathname] ?? "home", authService.getCurrentUser()));
+      setListingId(new URLSearchParams(window.location.search).get("id"));
     };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
-  const go = (next: Route) => {
-    const destination = next === "profile" && !user ? "login" : next;
-    window.history.pushState({}, "", routeToPath[destination]);
+  const go: GoFn = (next, id) => {
+    const destination = guard(next, user);
+    const query = destination === "product" && id ? `?id=${encodeURIComponent(id)}` : "";
+    window.history.pushState({}, "", routeToPath[destination] + query);
+    if (destination === "product") setListingId(id ?? null);
     setRoute(destination);
     window.scrollTo(0, 0);
   };
-  const onAuthenticated = (account: User) => { setUser(account); go("home"); };
+  const onAuthenticated = (account: User) => { setUser(account); setSaved(savedService.getIds(account.id)); go("home"); };
   const onLogout = () => {
     authService.logout();
     setUser(null);
+    setSaved(savedService.getIds(null));
     window.history.replaceState({}, "", routeToPath.welcome);
     setRoute("welcome");
     window.scrollTo(0, 0);
   };
-  const toggleSaved = (id: number) => setSaved((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+  const toggleSaved = (id: string) => setSaved(savedService.toggle(user?.id, id));
+  const publish: Parameters<typeof CreateScreen>[0]["onPublish"] = (input) => {
+    if (!user) throw new Error("Please log in to publish a listing.");
+    listingService.create(input, user);
+    setListings(listingService.getAll());
+  };
   const screens: Record<Route, ReactNode> = {
-    welcome: <WelcomeScreen go={go} />, home: <HomeScreen go={go} saved={saved} toggleSaved={toggleSaved} />, login: <AuthScreen key="login" mode="login" go={go} onAuthenticated={onAuthenticated} />, signup: <AuthScreen key="signup" mode="signup" go={go} onAuthenticated={onAuthenticated} />, product: <ProductScreen go={go} saved={saved} toggleSaved={toggleSaved} />, saved: <SavedScreen go={go} saved={saved} toggleSaved={toggleSaved} />, messages: <MessagesScreen go={go} />, chat: <ChatScreen go={go} />, profile: user ? <ProfileScreen go={go} user={user} onLogout={onLogout} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, create: <CreateScreen go={go} />,
+    welcome: <WelcomeScreen go={go} />, home: <HomeScreen go={go} listings={listings} saved={saved} toggleSaved={toggleSaved} />, login: <AuthScreen key="login" mode="login" go={go} onAuthenticated={onAuthenticated} />, signup: <AuthScreen key="signup" mode="signup" go={go} onAuthenticated={onAuthenticated} />, product: <ProductScreen key={listingId ?? "none"} go={go} item={listings.find((item) => item.id === listingId)} saved={saved} toggleSaved={toggleSaved} />, saved: <SavedScreen go={go} listings={listings} saved={saved} toggleSaved={toggleSaved} />, messages: <MessagesScreen go={go} />, chat: <ChatScreen go={go} />, profile: user ? <ProfileScreen go={go} user={user} onLogout={onLogout} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, create: user ? <CreateScreen go={go} onPublish={publish} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />,
   };
   return <div className="app-shell">{screens[route]}</div>;
 }
