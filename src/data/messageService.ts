@@ -135,6 +135,23 @@ export const messageService = {
     );
     return message;
   },
+
+  /** Keeps stored names in step when a user edits their full name. */
+  syncUserName(user: User): void {
+    const name = formatSellerName(user.fullName);
+    const conversations = readConversations();
+    const stale = (c: Conversation) =>
+      (c.buyerId === user.id && c.buyerName !== name) || (c.sellerId === user.id && c.sellerName !== name);
+    if (!conversations.some(stale)) return;
+    writeList(
+      CONVERSATIONS_KEY,
+      conversations.map((c) => ({
+        ...c,
+        buyerName: c.buyerId === user.id ? name : c.buyerName,
+        sellerName: c.sellerId === user.id ? name : c.sellerName,
+      })),
+    );
+  },
 };
 
 /** Other person's display name from the viewer's point of view. */

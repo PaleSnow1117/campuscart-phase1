@@ -13,6 +13,15 @@ export type ListingCategory = (typeof LISTING_CATEGORIES)[number];
 export const LISTING_CONDITIONS = ["Good as new", "Brand new", "Lightly used"] as const;
 export type ListingCondition = (typeof LISTING_CONDITIONS)[number];
 
+/** Campuses a user can pick from in Profile > Campus. */
+export const CAMPUSES = [
+  "URS Angono", "URS Antipolo", "URS Binangonan", "URS Cainta", "URS Cardona",
+  "URS Morong", "URS Pililla", "URS Rodriguez", "URS Tanay", "URS Taytay",
+] as const;
+
+/** The parts of a User that can be edited from the Profile screens. */
+export type ProfileChanges = Partial<Pick<User, "fullName" | "username" | "email" | "campus">>;
+
 export type Listing = {
   id: string;
   title: string;

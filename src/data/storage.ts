@@ -87,3 +87,11 @@ export function getSavedIds(ownerId: string): string[] {
 export function saveSavedIds(ownerId: string, ids: string[]): void {
   localStorage.setItem(SAVED_KEY, JSON.stringify({ ...readSavedMap(), [ownerId]: ids }));
 }
+
+/** Used when a listing is deleted so nobody keeps a dangling saved id. */
+export function removeSavedIdEverywhere(listingId: string): void {
+  const map = readSavedMap();
+  const next: Record<string, string[]> = {};
+  for (const [owner, ids] of Object.entries(map)) next[owner] = ids.filter((id) => id !== listingId);
+  localStorage.setItem(SAVED_KEY, JSON.stringify(next));
+}

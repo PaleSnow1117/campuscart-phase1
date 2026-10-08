@@ -1,6 +1,7 @@
 import {
   getSavedIds,
   getStoredListings,
+  removeSavedIdEverywhere,
   saveSavedIds,
   saveStoredListings,
 } from "./storage";
@@ -101,6 +102,49 @@ export const listingService = {
       throw new Error("Not enough browser storage for these photos. Try fewer or smaller photos.");
     }
     return listing;
+  },
+
+  /** Edits a listing the user owns. Seller, campus and posted date stay as they were. */
+  update(id: string, input: NewListingInput, user: User): Listing {
+    const all = this.getAll();
+    const current = all.find((listing) => listing.id === id);
+    if (!current || current.sellerId !== user.id) throw new Error("You can only edit your own listings.");
+    const title = input.title.trim();
+    const description = input.description.trim();
+    if (!title || !description) throw new Error("Please fill in all fields.");
+    if (!(input.price >= 0)) throw new Error("Please enter a valid price.");
+    const updated: Listing = {
+      ...current, title, description,
+      price: input.price, condition: input.condition, category: input.category, images: input.images,
+    };
+    try {
+      saveStoredListings(all.map((listing) => (listing.id === id ? updated : listing)));
+    } catch {
+      throw new Error("Not enough browser storage for these photos. Try fewer or smaller photos.");
+    }
+    return updated;
+  },
+
+  /** Deletes a listing the user owns and drops it from every saved list. */
+  remove(id: string, user: User): void {
+    const all = this.getAll();
+    const current = all.find((listing) => listing.id === id);
+    if (!current || current.sellerId !== user.id) throw new Error("You can only delete your own listings.");
+    saveStoredListings(all.filter((listing) => listing.id !== id));
+    removeSavedIdEverywhere(id);
+  },
+
+  /** Keeps the seller name on a user's listings in step with their profile. */
+  syncSellerName(user: User): void {
+    const all = this.getAll();
+    const name = formatSellerName(user.fullName);
+    if (!all.some((listing) => listing.sellerId === user.id && listing.sellerName !== name)) return;
+    saveStoredListings(all.map((listing) => (listing.sellerId === user.id ? { ...listing, sellerName: name } : listing)));
+  },
+
+  /** Pure helper: the listings a given user posted. */
+  forSeller(listings: Listing[], sellerId: string): Listing[] {
+    return listings.filter((listing) => listing.sellerId === sellerId);
   },
 
   /** Pure filter so UI components stay free of matching logic. */

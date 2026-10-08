@@ -3,7 +3,7 @@ import { authService } from "./data/authService";
 import { imageService, MAX_IMAGES } from "./data/imageService";
 import { artKind, formatPostedAt, formatPrice, listingService, parsePrice, savedService } from "./data/listingService";
 import { formatConversationTime, formatDayLabel, formatMessageTime, initialsOf, messageService, otherPartyName } from "./data/messageService";
-import { LISTING_CATEGORIES, LISTING_CONDITIONS, type Listing, type ListingCategory, type ListingCondition, type Message, type User } from "./data/types";
+import { CAMPUSES, LISTING_CATEGORIES, LISTING_CONDITIONS, type Listing, type ListingCategory, type ListingCondition, type Message, type ProfileChanges, type User } from "./data/types";
 
 type Route =
   | "welcome"
@@ -15,7 +15,12 @@ type Route =
   | "messages"
   | "chat"
   | "profile"
-  | "create";
+  | "create"
+  | "mylistings"
+  | "edit"
+  | "campus"
+  | "account"
+  | "help";
 
 type IconName =
   | "arrow"
@@ -52,6 +57,11 @@ const pathToRoute: Record<string, Route> = {
   "/chat": "chat",
   "/profile": "profile",
   "/create": "create",
+  "/my-listings": "mylistings",
+  "/edit": "edit",
+  "/campus": "campus",
+  "/account": "account",
+  "/help": "help",
 };
 
 const routeToPath: Record<Route, string> = Object.fromEntries(
@@ -61,7 +71,7 @@ const routeToPath: Record<Route, string> = Object.fromEntries(
 type GoFn = (route: Route, listingId?: string) => void;
 
 // Screens that need a signed-in user (profile as in Phase 1; create needs a seller ID; messages belong to an account).
-const protectedRoutes: Route[] = ["profile", "create", "messages", "chat"];
+const protectedRoutes: Route[] = ["profile", "create", "messages", "chat", "mylistings", "edit", "campus", "account", "help"];
 const guard = (route: Route, user: User | null): Route => (protectedRoutes.includes(route) && !user ? "login" : route);
 
 function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
@@ -276,15 +286,72 @@ function ChatScreen({ go, user, conversationId, listings }: { go: GoFn; user: Us
 }
 
 function ProfileScreen({ go, user, onLogout }: { go: (route: Route) => void; user: User; onLogout: () => void }) {
-  const rows: { label: string; icon: IconName; route?: Route }[] = [{ label: "My listings", icon: "uniform" }, { label: "Saved items", icon: "heart", route: "saved" }, { label: "Campus & account", icon: "location" }, { label: "Help and safety", icon: "shield" }];
-  const initials = user.fullName.trim().split(/\s+/).slice(0, 2).map((part) => part[0].toUpperCase()).join("");
-  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content profile-content"><p className="section-kicker">YOUR CAMPUSCART</p><h1>Profile.</h1><div className="profile-card"><span className="profile-avatar">{initials}</span><div><h2>{user.fullName}</h2><p><Icon name="location" size={12} /> {user.campus}</p><span><Icon name="check" size={11} /> Campus account</span></div></div><button className="primary-button list-button" onClick={() => go("create")} type="button"><Icon name="plus" /> List an item</button><div className="profile-menu">{rows.map((row) => <button key={row.label} onClick={() => row.route && go(row.route)} type="button"><span><Icon name={row.icon} size={19} /></span>{row.label}<Icon name="chevron" size={17} /></button>)}</div><button className="logout" type="button" onClick={onLogout}>Log out</button></main><BottomNav current="profile" go={go} /></div>;
+  const rows: { label: string; icon: IconName; route: Route }[] = [{ label: "My listings", icon: "uniform", route: "mylistings" }, { label: "Saved items", icon: "heart", route: "saved" }, { label: "Campus", icon: "location", route: "campus" }, { label: "Account", icon: "profile", route: "account" }, { label: "Help and safety", icon: "shield", route: "help" }];
+  const initials = initialsOf(user.fullName || user.username);
+  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content profile-content"><p className="section-kicker">YOUR CAMPUSCART</p><h1>Profile.</h1><div className="profile-card"><span className="profile-avatar">{initials}</span><div><h2>{user.fullName || user.username}</h2><p><Icon name="location" size={12} /> {user.campus || "No campus selected"}</p><span><Icon name="check" size={11} /> Campus account</span></div></div><button className="primary-button list-button" onClick={() => go("create")} type="button"><Icon name="plus" /> List an item</button><div className="profile-menu">{rows.map((row) => <button key={row.label} onClick={() => go(row.route)} type="button"><span><Icon name={row.icon} size={19} /></span>{row.label}<Icon name="chevron" size={17} /></button>)}</div><button className="logout" type="button" onClick={onLogout}>Log out</button></main><BottomNav current="profile" go={go} /></div>;
 }
 
-function CreateScreen({ go, onPublish }: { go: GoFn; onPublish: (input: { title: string; price: number; condition: ListingCondition; category: ListingCategory; description: string; images: string[] }) => void }) {
+function MyListingsScreen({ go, user, listings, saved, toggleSaved, onDelete }: { go: GoFn; user: User; listings: Listing[]; saved: string[]; toggleSaved: (id: string) => void; onDelete: (id: string) => void }) {
+  const [error, setError] = useState("");
+  const mine = listingService.forSeller(listings, user.id);
+  const remove = (listing: Listing) => {
+    if (!window.confirm(`Delete "${listing.title}"? This can't be undone.`)) return;
+    try { setError(""); onDelete(listing.id); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to delete this listing."); }
+  };
+  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="My listings" /><main className="page-content"><p className="section-kicker">YOUR SHELF</p><h1>My <em>listings.</em></h1>{error && <p role="alert" style={{ margin: "0 0 10px", color: "#b13a3a", fontSize: 11 }}>{error}</p>}{mine.length ? <div className="listing-grid saved-grid">{mine.map((listing) => <div key={listing.id}><ListingCard listing={listing} saved={saved.includes(listing.id)} toggleSaved={toggleSaved} go={go} /><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 8 }}><button className="outline-button" type="button" style={{ minHeight: 34, fontSize: 11 }} onClick={() => go("edit", listing.id)}>Edit</button><button className="outline-button" type="button" style={{ minHeight: 34, fontSize: 11, color: "#b13a3a" }} onClick={() => remove(listing)}>Delete</button></div></div>)}</div> : <div className="empty-state"><span><Icon name="uniform" size={33} /></span><h2>No listings yet</h2><p>Items you list for sale will show up here.</p><button className="primary-button" type="button" onClick={() => go("create")}>List an item</button></div>}</main><BottomNav current="profile" go={go} /></div>;
+}
+
+function CampusScreen({ go, user, onSave }: { go: GoFn; user: User; onSave: (changes: ProfileChanges) => void }) {
+  const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
+  const options: string[] = [...CAMPUSES];
+  if (user.campus && !options.includes(user.campus)) options.unshift(user.campus);
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    try {
+      onSave({ campus: String(new FormData(event.currentTarget).get("campus") ?? "") });
+      setMessage({ text: "Campus updated.", error: false });
+    } catch (cause) {
+      setMessage({ text: cause instanceof Error ? cause.message : "Unable to update your campus.", error: true });
+    }
+  };
+  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Campus" /><main className="create-content"><p className="section-kicker">YOUR CAMPUS</p><h1>Where do you <em>sell?</em></h1><form onSubmit={submit}><label>Campus<select name="campus" defaultValue={user.campus || options[0]}>{options.map((campus) => <option key={campus}>{campus}</option>)}</select></label><p className="description">New listings you post will show this campus. Listings you already posted keep the campus they were posted with.</p>{message && <p role={message.error ? "alert" : "status"} style={{ margin: 0, color: message.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{message.text}</p>}<button className="primary-button wide" type="submit">Save campus <Icon name="arrow" size={17} /></button></form></main><BottomNav current="profile" go={go} /></div>;
+}
+
+function AccountScreen({ go, user, onSave }: { go: GoFn; user: User; onSave: (changes: ProfileChanges) => void }) {
+  const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const fields = new FormData(event.currentTarget);
+    try {
+      onSave({ fullName: String(fields.get("fullName") ?? ""), username: String(fields.get("username") ?? ""), email: String(fields.get("email") ?? "") });
+      setMessage({ text: "Account updated.", error: false });
+    } catch (cause) {
+      setMessage({ text: cause instanceof Error ? cause.message : "Unable to update your account.", error: true });
+    }
+  };
+  const joined = new Date(user.createdAt);
+  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Account" /><main className="create-content"><p className="section-kicker">YOUR ACCOUNT</p><h1>Account <em>details.</em></h1><form key={`${user.fullName}|${user.username}|${user.email}`} onSubmit={submit}><label>Full Name<input required name="fullName" defaultValue={user.fullName} placeholder="Enter your full name" /></label><label>Username<input required name="username" defaultValue={user.username} placeholder="Enter your username" /></label><label>Campus Email<input required name="email" type="email" defaultValue={user.email} placeholder="name@urs.edu.ph" /></label><p className="description">{Number.isNaN(joined.getTime()) ? "Member of CampusCart" : `Member since ${joined.toLocaleDateString("en-PH", { month: "long", year: "numeric" })}`} · {user.campus || "No campus selected"}</p>{message && <p role={message.error ? "alert" : "status"} style={{ margin: 0, color: message.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{message.text}</p>}<button className="primary-button wide" type="submit">Save changes <Icon name="arrow" size={17} /></button></form><button className="outline-button wide" type="button" disabled style={{ width: "100%", marginTop: 22, opacity: 0.55 }}>Change password</button><p className="description" style={{ marginTop: 8 }}>Password changes will be available once online accounts are added. Your password is never shown here.</p></main><BottomNav current="profile" go={go} /></div>;
+}
+
+function HelpScreen({ go }: { go: GoFn }) {
+  const sections: { title: string; items: string[] }[] = [
+    { title: "How buying works", items: ["Browse the marketplace or search for what you need.", "Open a listing to see photos, condition, price and the seller.", "Tap Message seller to ask questions and agree on a meet-up.", "Inspect the item before you pay."] },
+    { title: "How selling works", items: ["Tap List an item and add clear photos, a title, price, condition and description.", "Find your items any time under Profile > My listings, where you can edit or delete them.", "Reply to interested students from Messages.", "Delete the listing once the item is sold."] },
+    { title: "Marketplace safety tips", items: ["Keep conversations inside CampusCart.", "Never share your password or personal ID numbers.", "Be careful with prices that look too good to be true.", "Pay only after you have seen the item."] },
+    { title: "Meeting up on campus", items: ["Meet in a public, busy campus area during the day.", "Bring a friend if you can, and tell someone where you are going.", "Do not go to private places or leave campus for a meet-up.", "Leave if anything feels wrong."] },
+    { title: "If something seems suspicious", items: ["Stop replying and do not send money or personal details.", "Note the listing title and the seller's name.", "Do not meet up with someone who pressures you or keeps changing the plan."] },
+  ];
+  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Help and safety" /><main className="page-content"><p className="section-kicker">WE'VE GOT YOU</p><h1>Help &amp; <em>safety.</em></h1><div className="detail-info" style={{ padding: 0 }}>{sections.map((section) => <div key={section.title}><h3>{section.title}</h3><ul className="description" style={{ margin: 0, paddingLeft: 18 }}>{section.items.map((item) => <li key={item}>{item}</li>)}</ul></div>)}<h3>Reporting a problem</h3><p className="description">CampusCart can&apos;t take reports inside the app yet, so nothing you do here is sent to anyone. If a listing or user seems unsafe, tell your campus security or student affairs office and share the listing title and seller name. In an emergency, call 911.</p><div className="safety-note"><Icon name="shield" /><p><strong>Your data stays on this device</strong><br />This prototype saves accounts, listings and messages in your browser only.</p></div></div></main><BottomNav current="profile" go={go} /></div>;
+}
+
+function MissingListingScreen({ go }: { go: GoFn }) {
+  return <div className="screen nav-screen"><Topbar go={go} back="mylistings" title="Edit listing" /><main className="page-content"><div className="empty-state"><span><Icon name="search" size={33} /></span><h2>Listing not found</h2><p>It may have been deleted, or it isn&apos;t yours to edit.</p><button className="primary-button" type="button" onClick={() => go("mylistings")}>Back to my listings</button></div></main></div>;
+}
+
+function CreateScreen({ go, onPublish, listing }: { go: GoFn; listing?: Listing; onPublish: (input: { title: string; price: number; condition: ListingCondition; category: ListingCategory; description: string; images: string[] }) => void }) {
   const [done, setDone] = useState(false);
   const [error, setError] = useState("");
-  const [images, setImages] = useState<string[]>([]);
+  const [images, setImages] = useState<string[]>(listing?.images ?? []);
   const fileInput = useRef<HTMLInputElement>(null);
   const pickPhotos = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
@@ -318,8 +385,9 @@ function CreateScreen({ go, onPublish }: { go: GoFn; onPublish: (input: { title:
       setError(cause instanceof Error ? cause.message : "Unable to publish your listing. Please try again.");
     }
   };
+  if (done && listing) return <div className="screen success-screen"><span><Icon name="check" size={36} /></span><p className="under-label">LISTING UPDATED</p><h1>Your changes are saved.</h1><p>Your listing is up to date for students nearby.</p><button className="primary-button wide" type="button" onClick={() => go("mylistings")}>Back to my listings</button></div>;
   if (done) return <div className="screen success-screen"><span><Icon name="check" size={36} /></span><p className="under-label">LISTING PUBLISHED</p><h1>Your good find is now live.</h1><p>Students nearby can now discover and message you about your item.</p><button className="primary-button wide" type="button" onClick={() => go("home")}>Back to marketplace</button></div>;
-  return <div className="screen create-screen"><Topbar go={go} back="home" title="List an item" /><main className="create-content"><p className="section-kicker">SELL ON CAMPUS</p><h1>Pass on a <em>good thing.</em></h1><form onSubmit={submit}><input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={pickPhotos} /><button className="photo-upload" type="button" onClick={() => fileInput.current?.click()}><Icon name="camera" size={28} /><strong>Add photos</strong><small>{images.length ? `${images.length} of ${MAX_IMAGES} photo${images.length > 1 ? "s" : ""} added` : `Add up to ${MAX_IMAGES} clear photos`}</small></button><label>Item title<input required name="title" placeholder="What are you selling?" /></label><div className="two-fields"><label>Price<input required name="price" inputMode="decimal" placeholder="₱ 0.00" /></label><label>Condition<select name="condition" defaultValue="Good as new">{LISTING_CONDITIONS.map((item) => <option key={item}>{item}</option>)}</select></label></div><label>Category<select name="category" defaultValue="Uniforms">{LISTING_CATEGORIES.map((item) => <option key={item}>{item}</option>)}</select></label><label>Description<textarea required name="description" placeholder="Share useful details about your item" /></label>{error && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11 }}>{error}</p>}<button className="primary-button wide" type="submit">Publish listing <Icon name="arrow" size={17} /></button></form></main></div>;
+  return <div className="screen create-screen"><Topbar go={go} back={listing ? "mylistings" : "home"} title={listing ? "Edit listing" : "List an item"} /><main className="create-content"><p className="section-kicker">{listing ? "EDIT YOUR LISTING" : "SELL ON CAMPUS"}</p><h1>{listing ? <>Update your <em>listing.</em></> : <>Pass on a <em>good thing.</em></>}</h1><form onSubmit={submit}><input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={pickPhotos} /><button className="photo-upload" type="button" onClick={() => fileInput.current?.click()}><Icon name="camera" size={28} /><strong>Add photos</strong><small>{images.length ? `${images.length} of ${MAX_IMAGES} photo${images.length > 1 ? "s" : ""} added` : `Add up to ${MAX_IMAGES} clear photos`}</small></button>{images.length > 0 && <button className="seller-link" type="button" style={{ marginTop: 0, alignSelf: "flex-start" }} onClick={() => setImages([])}>Remove all photos</button>}<label>Item title<input required name="title" defaultValue={listing?.title} placeholder="What are you selling?" /></label><div className="two-fields"><label>Price<input required name="price" inputMode="decimal" defaultValue={listing ? String(listing.price) : undefined} placeholder="₱ 0.00" /></label><label>Condition<select name="condition" defaultValue={listing?.condition ?? "Good as new"}>{LISTING_CONDITIONS.map((item) => <option key={item}>{item}</option>)}</select></label></div><label>Category<select name="category" defaultValue={listing?.category ?? "Uniforms"}>{LISTING_CATEGORIES.map((item) => <option key={item}>{item}</option>)}</select></label><label>Description<textarea required name="description" defaultValue={listing?.description} placeholder="Share useful details about your item" /></label>{error && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11 }}>{error}</p>}<button className="primary-button wide" type="submit">{listing ? "Save changes" : "Publish listing"} <Icon name="arrow" size={17} /></button></form></main></div>;
 }
 
 function App() {
@@ -340,9 +408,9 @@ function App() {
   }, []);
   const go: GoFn = (next, id) => {
     const destination = guard(next, user);
-    const query = destination === "product" && id ? `?id=${encodeURIComponent(id)}` : destination === "chat" && id ? `?c=${encodeURIComponent(id)}` : "";
+    const query = (destination === "product" || destination === "edit") && id ? `?id=${encodeURIComponent(id)}` : destination === "chat" && id ? `?c=${encodeURIComponent(id)}` : "";
     window.history.pushState({}, "", routeToPath[destination] + query);
-    if (destination === "product") setListingId(id ?? null);
+    if (destination === "product" || destination === "edit") setListingId(id ?? null);
     if (destination === "chat") setConversationId(id ?? null);
     setRoute(destination);
     window.scrollTo(0, 0);
@@ -372,7 +440,35 @@ function App() {
     listingService.create(input, user);
     setListings(listingService.getAll());
   };
+  const editListing: Parameters<typeof CreateScreen>[0]["onPublish"] = (input) => {
+    if (!user || !listingId) throw new Error("Please log in to edit a listing.");
+    listingService.update(listingId, input, user);
+    setListings(listingService.getAll());
+  };
+  const deleteListing = (id: string) => {
+    if (!user) throw new Error("Please log in to delete a listing.");
+    listingService.remove(id, user);
+    setListings(listingService.getAll());
+    setSaved(savedService.getIds(user.id));
+  };
+  const saveProfile = (changes: ProfileChanges) => {
+    if (!user) throw new Error("Please log in to update your profile.");
+    const updated = authService.updateProfile(user.id, changes);
+    setUser(updated);
+    if (changes.fullName !== undefined) {
+      listingService.syncSellerName(updated);
+      messageService.syncUserName(updated);
+      setListings(listingService.getAll());
+    }
+  };
+  const loginScreen = <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />;
+  const editing = user ? listings.find((item) => item.id === listingId && item.sellerId === user.id) : undefined;
   const screens: Record<Route, ReactNode> = {
+    mylistings: user ? <MyListingsScreen go={go} user={user} listings={listings} saved={saved} toggleSaved={toggleSaved} onDelete={deleteListing} /> : loginScreen,
+    edit: !user ? loginScreen : editing ? <CreateScreen key={editing.id} go={go} listing={editing} onPublish={editListing} /> : <MissingListingScreen go={go} />,
+    campus: user ? <CampusScreen go={go} user={user} onSave={saveProfile} /> : loginScreen,
+    account: user ? <AccountScreen go={go} user={user} onSave={saveProfile} /> : loginScreen,
+    help: user ? <HelpScreen go={go} /> : loginScreen,
     welcome: <WelcomeScreen go={go} />, home: <HomeScreen go={go} listings={listings} saved={saved} toggleSaved={toggleSaved} />, login: <AuthScreen key="login" mode="login" go={go} onAuthenticated={onAuthenticated} />, signup: <AuthScreen key="signup" mode="signup" go={go} onAuthenticated={onAuthenticated} />, product: <ProductScreen key={listingId ?? "none"} go={go} item={listings.find((item) => item.id === listingId)} saved={saved} toggleSaved={toggleSaved} onMessageSeller={messageSeller} />, saved: <SavedScreen go={go} listings={listings} saved={saved} toggleSaved={toggleSaved} />, messages: user ? <MessagesScreen go={go} user={user} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, chat: user ? <ChatScreen key={conversationId ?? "none"} go={go} user={user} conversationId={conversationId} listings={listings} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, profile: user ? <ProfileScreen go={go} user={user} onLogout={onLogout} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, create: user ? <CreateScreen go={go} onPublish={publish} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />,
   };
   return <div className="app-shell">{screens[route]}</div>;
