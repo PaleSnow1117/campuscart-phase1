@@ -37,7 +37,7 @@ const seedListings: Listing[] = [
 ];
 
 /** "Juan Dela Cruz" -> "Juan C." to match the existing card style. */
-function formatSellerName(fullName: string): string {
+export function formatSellerName(fullName: string): string {
   const parts = fullName.trim().split(/\s+/).filter(Boolean);
   if (parts.length < 2) return parts[0] ?? "Student";
   return `${parts[0]} ${parts[parts.length - 1][0].toUpperCase()}.`;

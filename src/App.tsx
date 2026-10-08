@@ -2,7 +2,8 @@ import { type ChangeEvent, type FormEvent, type ReactNode, useEffect, useRef, us
 import { authService } from "./data/authService";
 import { imageService, MAX_IMAGES } from "./data/imageService";
 import { artKind, formatPostedAt, formatPrice, listingService, parsePrice, savedService } from "./data/listingService";
-import { LISTING_CATEGORIES, LISTING_CONDITIONS, type Listing, type ListingCategory, type ListingCondition, type User } from "./data/types";
+import { formatConversationTime, formatDayLabel, formatMessageTime, initialsOf, messageService, otherPartyName } from "./data/messageService";
+import { LISTING_CATEGORIES, LISTING_CONDITIONS, type Listing, type ListingCategory, type ListingCondition, type Message, type User } from "./data/types";
 
 type Route =
   | "welcome"
@@ -59,8 +60,8 @@ const routeToPath: Record<Route, string> = Object.fromEntries(
 
 type GoFn = (route: Route, listingId?: string) => void;
 
-// Screens that need a signed-in user (profile as in Phase 1; create needs a seller ID).
-const protectedRoutes: Route[] = ["profile", "create"];
+// Screens that need a signed-in user (profile as in Phase 1; create needs a seller ID; messages belong to an account).
+const protectedRoutes: Route[] = ["profile", "create", "messages", "chat"];
 const guard = (route: Route, user: User | null): Route => (protectedRoutes.includes(route) && !user ? "login" : route);
 
 function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
@@ -226,13 +227,14 @@ function AuthScreen({ mode, go, onAuthenticated }: { mode: "login" | "signup"; g
   </form>{login && <div className="continue"><span>Continue With</span><button type="button" onClick={() => setError("Google login is not available for local accounts.")}>G&nbsp;&nbsp; Google</button></div>}<p className="account-prompt">{login ? "Don't Have An Account? " : "Already have an account? "}<button type="button" onClick={() => go(login ? "signup" : "login")}>{login ? "Sign up" : "Login"}</button></p></main></div>;
 }
 
-function ProductScreen({ go, item, saved, toggleSaved }: { go: GoFn; item?: Listing; saved: string[]; toggleSaved: (id: string) => void }) {
+function ProductScreen({ go, item, saved, toggleSaved, onMessageSeller }: { go: GoFn; item?: Listing; saved: string[]; toggleSaved: (id: string) => void; onMessageSeller: (listing: Listing) => string | null }) {
   const [photo, setPhoto] = useState(0);
+  const [notice, setNotice] = useState("");
   if (!item) return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main className="page-content"><div className="empty-state"><span><Icon name="search" size={33} /></span><h2>Listing not found</h2><p>This item may have been removed.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div></main></div>;
   const isSaved = saved.includes(item.id);
   const photos = item.images.length;
   const initials = item.sellerName.split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("");
-  return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main><div className="detail-art" onClick={() => photos > 1 && setPhoto((photo + 1) % photos)}><ProductArt kind={artKind(item.category)} image={item.images[photo % Math.max(photos, 1)]} large /><button className={`save-button detail-save ${isSaved ? "is-saved" : ""}`} type="button" onClick={(event) => { event.stopPropagation(); toggleSaved(item.id); }}><Icon name="heart" /></button><span className="photo-count">{(photo % Math.max(photos, 1)) + 1} / {Math.max(photos, 1)}</span></div><div className="detail-info"><div className="condition-row"><span>{item.condition}</span><small>{formatPostedAt(item.createdAt)}</small></div><h2>{item.title}</h2><strong className="detail-price">{formatPrice(item.price)}</strong><div className="seller-box"><span className="seller-avatar">{initials}</span><div><small>SELLER</small><strong>{item.sellerName}</strong><p><Icon name="location" size={12} /> {item.campus} Campus</p></div><Icon name="chevron" /></div><h3>About this item</h3><p className="description">{item.description}</p><div className="safety-note"><Icon name="shield" /><p><strong>Buy safely on campus</strong><br />Meet in a public campus area and inspect the item before paying.</p></div></div></main><div className="detail-actions"><button className="outline-button" type="button" onClick={() => toggleSaved(item.id)}><Icon name="heart" size={18} /> Save</button><button className="primary-button" type="button" onClick={() => go("chat")}><Icon name="chat" size={18} /> Message seller</button></div></div>;
+  return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main><div className="detail-art" onClick={() => photos > 1 && setPhoto((photo + 1) % photos)}><ProductArt kind={artKind(item.category)} image={item.images[photo % Math.max(photos, 1)]} large /><button className={`save-button detail-save ${isSaved ? "is-saved" : ""}`} type="button" onClick={(event) => { event.stopPropagation(); toggleSaved(item.id); }}><Icon name="heart" /></button><span className="photo-count">{(photo % Math.max(photos, 1)) + 1} / {Math.max(photos, 1)}</span></div><div className="detail-info"><div className="condition-row"><span>{item.condition}</span><small>{formatPostedAt(item.createdAt)}</small></div><h2>{item.title}</h2><strong className="detail-price">{formatPrice(item.price)}</strong><div className="seller-box"><span className="seller-avatar">{initials}</span><div><small>SELLER</small><strong>{item.sellerName}</strong><p><Icon name="location" size={12} /> {item.campus} Campus</p></div><Icon name="chevron" /></div><h3>About this item</h3><p className="description">{item.description}</p>{notice && <p role="alert" style={{ margin: "0 0 10px", color: "#b13a3a", fontSize: 11 }}>{notice}</p>}<div className="safety-note"><Icon name="shield" /><p><strong>Buy safely on campus</strong><br />Meet in a public campus area and inspect the item before paying.</p></div></div></main><div className="detail-actions"><button className="outline-button" type="button" onClick={() => toggleSaved(item.id)}><Icon name="heart" size={18} /> Save</button><button className="primary-button" type="button" onClick={() => setNotice(onMessageSeller(item) ?? "")}><Icon name="chat" size={18} /> Message seller</button></div></div>;
 }
 
 function SavedScreen({ go, listings, saved, toggleSaved }: { go: GoFn; listings: Listing[]; saved: string[]; toggleSaved: (id: string) => void }) {
@@ -240,18 +242,37 @@ function SavedScreen({ go, listings, saved, toggleSaved }: { go: GoFn; listings:
   return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content"><p className="section-kicker">YOUR SHORTLIST</p><h1>Saved <em>finds.</em></h1>{items.length ? <div className="listing-grid saved-grid">{items.map((listing) => <ListingCard key={listing.id} listing={listing} saved toggleSaved={toggleSaved} go={go} />)}</div> : <div className="empty-state"><span><Icon name="heart" size={33} /></span><h2>No saved finds yet</h2><p>Tap the heart on anything you want to come back to.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div>}</main><BottomNav current="saved" go={go} /></div>;
 }
 
-function MessagesScreen({ go }: { go: (route: Route) => void }) {
-  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content"><p className="section-kicker">CAMPUS CONVERSATIONS</p><h1>Your <em>messages.</em></h1><label className="search-box message-search"><Icon name="search" size={17} /><input placeholder="Search messages" /></label><button className="conversation" type="button" onClick={() => go("chat")}><span className="seller-avatar">BR</span><span className="conversation-copy"><strong>Balmond R.</strong><small>URS P.E UNIFORM</small><p>Yes, it&apos;s still available!</p></span><span className="conversation-meta"><small>10:42</small><b>1</b></span></button><button className="conversation" type="button"><span className="seller-avatar gold">MS</span><span className="conversation-copy"><strong>Miya S.</strong><small>CALCULUS BOOK</small><p>Thank you!</p></span><span className="conversation-meta"><small>Yesterday</small></span></button></main><BottomNav current="messages" go={go} /></div>;
+function MessagesScreen({ go, user }: { go: GoFn; user: User }) {
+  const [conversations] = useState(() => messageService.getConversations(user.id));
+  const [search, setSearch] = useState("");
+  const text = search.toLowerCase().trim();
+  const visible = conversations.filter((conversation) => !text || [otherPartyName(conversation, user.id), conversation.listingTitle, conversation.lastMessage].some((field) => field.toLowerCase().includes(text)));
+  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content"><p className="section-kicker">CAMPUS CONVERSATIONS</p><h1>Your <em>messages.</em></h1><label className="search-box message-search"><Icon name="search" size={17} /><input aria-label="Search messages" placeholder="Search messages" value={search} onChange={(event) => setSearch(event.target.value)} /></label>{conversations.length === 0 ? <div className="empty-state"><span><Icon name="chat" size={33} /></span><h2>No messages yet</h2><p>Open a listing and tap Message seller to start a conversation.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div> : visible.length === 0 ? <div className="empty-state"><h2>No matches</h2><p>Try a different name, item or word.</p></div> : visible.map((conversation, index) => { const name = otherPartyName(conversation, user.id); return <button key={conversation.id} className="conversation" type="button" onClick={() => go("chat", conversation.id)}><span className={`seller-avatar ${index % 2 ? "gold" : ""}`}>{initialsOf(name)}</span><span className="conversation-copy"><strong>{name}</strong><small>{conversation.listingTitle}</small><p>{conversation.lastMessage || "No messages yet. Say hi!"}</p></span><span className="conversation-meta"><small>{formatConversationTime(conversation.updatedAt)}</small></span></button>; })}</main><BottomNav current="messages" go={go} /></div>;
 }
 
-function ChatScreen({ go }: { go: (route: Route) => void }) {
-  const [messages, setMessages] = useState([
-    { id: 1, text: "Hi! Is the P.E uniform still available?", mine: true },
-    { id: 2, text: "Yes, it’s still available!", mine: false },
-  ]);
+function ChatScreen({ go, user, conversationId, listings }: { go: GoFn; user: User; conversationId: string | null; listings: Listing[] }) {
+  const conversation = messageService.getConversation(conversationId, user.id);
+  const [messages, setMessages] = useState<Message[]>(() => (conversationId ? messageService.getMessages(conversationId, user.id) : []));
   const [draft, setDraft] = useState("");
-  const send = (event: FormEvent) => { event.preventDefault(); if (draft.trim()) { setMessages([...messages, { id: Date.now(), text: draft.trim(), mine: true }]); setDraft(""); } };
-  return <div className="screen chat-screen"><header className="chat-header"><button className="icon-button" onClick={() => go("messages")} type="button"><Icon name="back" /></button><span className="seller-avatar">BR</span><div><strong>Balmond R.</strong><small>Active now</small></div></header><div className="chat-item"><ProductArt kind="uniform" /><div><small>ABOUT THIS ITEM</small><strong>URS P.E UNIFORM</strong><span>₱1M</span></div></div><main className="bubbles"><span className="day-label">TODAY</span>{messages.map((message, index) => <div key={message.id} className={`bubble ${message.mine ? "mine" : "theirs"}`}>{message.text}<small>{index === messages.length - 1 ? "10:42" : "10:40"}</small></div>)}</main><form className="message-form" onSubmit={send}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Write a message..." aria-label="Message" /><button type="submit" aria-label="Send"><Icon name="send" size={18} /></button></form></div>;
+  const [error, setError] = useState("");
+  const bottom = useRef<HTMLDivElement>(null);
+  useEffect(() => { bottom.current?.scrollIntoView({ block: "end" }); }, [messages]);
+  if (!conversation) return <div className="screen nav-screen"><Topbar go={go} back="messages" title="Conversation" /><main className="page-content"><div className="empty-state"><span><Icon name="chat" size={33} /></span><h2>Conversation not found</h2><p>It may not exist, or it belongs to another account.</p><button className="primary-button" type="button" onClick={() => go("messages")}>Back to messages</button></div></main></div>;
+  const name = otherPartyName(conversation, user.id);
+  const listing = listings.find((item) => item.id === conversation.listingId);
+  const send = (event: FormEvent) => {
+    event.preventDefault();
+    if (!draft.trim()) return;
+    try {
+      const sent = messageService.send(conversation.id, user, draft);
+      setMessages((current) => [...current, sent]);
+      setDraft("");
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Unable to send your message.");
+    }
+  };
+  return <div className="screen chat-screen"><header className="chat-header"><button className="icon-button" onClick={() => go("messages")} type="button" aria-label="Back to messages"><Icon name="back" /></button><span className="seller-avatar">{initialsOf(name)}</span><div><strong>{name}</strong><small>Active now</small></div></header><div className="chat-item"><ProductArt kind={listing ? artKind(listing.category) : "tools"} image={listing?.images[0]} /><div><small>ABOUT THIS ITEM</small><strong>{listing?.title ?? conversation.listingTitle}</strong><span>{formatPrice(listing?.price ?? conversation.listingPrice)}</span></div></div><main className="bubbles">{messages.length === 0 && <span className="day-label">No messages yet. Say hi!</span>}{messages.map((message, index) => <div key={message.id} style={{ display: "contents" }}>{(index === 0 || formatDayLabel(message.createdAt) !== formatDayLabel(messages[index - 1].createdAt)) && <span className="day-label">{formatDayLabel(message.createdAt)}</span>}<div className={`bubble ${message.senderId === user.id ? "mine" : "theirs"}`}>{message.text}<small>{formatMessageTime(message.createdAt)}</small></div></div>)}{error && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11, alignSelf: "center" }}>{error}</p>}<div ref={bottom} /></main><form className="message-form" onSubmit={send}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Write a message..." aria-label="Message" maxLength={1000} /><button type="submit" aria-label="Send"><Icon name="send" size={18} /></button></form></div>;
 }
 
 function ProfileScreen({ go, user, onLogout }: { go: (route: Route) => void; user: User; onLogout: () => void }) {
@@ -306,20 +327,23 @@ function App() {
   const [listings, setListings] = useState<Listing[]>(() => listingService.getAll());
   const [saved, setSaved] = useState<string[]>(() => savedService.getIds(authService.getCurrentUser()?.id));
   const [listingId, setListingId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("id"));
+  const [conversationId, setConversationId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("c"));
   const [route, setRoute] = useState<Route>(() => guard(pathToRoute[window.location.pathname] ?? "home", authService.getCurrentUser()));
   useEffect(() => {
     const onPop = () => {
       setRoute(guard(pathToRoute[window.location.pathname] ?? "home", authService.getCurrentUser()));
       setListingId(new URLSearchParams(window.location.search).get("id"));
+      setConversationId(new URLSearchParams(window.location.search).get("c"));
     };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
   const go: GoFn = (next, id) => {
     const destination = guard(next, user);
-    const query = destination === "product" && id ? `?id=${encodeURIComponent(id)}` : "";
+    const query = destination === "product" && id ? `?id=${encodeURIComponent(id)}` : destination === "chat" && id ? `?c=${encodeURIComponent(id)}` : "";
     window.history.pushState({}, "", routeToPath[destination] + query);
     if (destination === "product") setListingId(id ?? null);
+    if (destination === "chat") setConversationId(id ?? null);
     setRoute(destination);
     window.scrollTo(0, 0);
   };
@@ -333,13 +357,23 @@ function App() {
     window.scrollTo(0, 0);
   };
   const toggleSaved = (id: string) => setSaved(savedService.toggle(user?.id, id));
+  /** Returns an error message to show on the listing, or null when it navigated away. */
+  const messageSeller = (listing: Listing): string | null => {
+    if (!user) { go("login"); return null; }
+    try {
+      go("chat", messageService.getOrCreateConversation(listing, user).id);
+      return null;
+    } catch (cause) {
+      return cause instanceof Error ? cause.message : "Unable to open this conversation.";
+    }
+  };
   const publish: Parameters<typeof CreateScreen>[0]["onPublish"] = (input) => {
     if (!user) throw new Error("Please log in to publish a listing.");
     listingService.create(input, user);
     setListings(listingService.getAll());
   };
   const screens: Record<Route, ReactNode> = {
-    welcome: <WelcomeScreen go={go} />, home: <HomeScreen go={go} listings={listings} saved={saved} toggleSaved={toggleSaved} />, login: <AuthScreen key="login" mode="login" go={go} onAuthenticated={onAuthenticated} />, signup: <AuthScreen key="signup" mode="signup" go={go} onAuthenticated={onAuthenticated} />, product: <ProductScreen key={listingId ?? "none"} go={go} item={listings.find((item) => item.id === listingId)} saved={saved} toggleSaved={toggleSaved} />, saved: <SavedScreen go={go} listings={listings} saved={saved} toggleSaved={toggleSaved} />, messages: <MessagesScreen go={go} />, chat: <ChatScreen go={go} />, profile: user ? <ProfileScreen go={go} user={user} onLogout={onLogout} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, create: user ? <CreateScreen go={go} onPublish={publish} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />,
+    welcome: <WelcomeScreen go={go} />, home: <HomeScreen go={go} listings={listings} saved={saved} toggleSaved={toggleSaved} />, login: <AuthScreen key="login" mode="login" go={go} onAuthenticated={onAuthenticated} />, signup: <AuthScreen key="signup" mode="signup" go={go} onAuthenticated={onAuthenticated} />, product: <ProductScreen key={listingId ?? "none"} go={go} item={listings.find((item) => item.id === listingId)} saved={saved} toggleSaved={toggleSaved} onMessageSeller={messageSeller} />, saved: <SavedScreen go={go} listings={listings} saved={saved} toggleSaved={toggleSaved} />, messages: user ? <MessagesScreen go={go} user={user} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, chat: user ? <ChatScreen key={conversationId ?? "none"} go={go} user={user} conversationId={conversationId} listings={listings} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, profile: user ? <ProfileScreen go={go} user={user} onLogout={onLogout} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, create: user ? <CreateScreen go={go} onPublish={publish} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />,
   };
   return <div className="app-shell">{screens[route]}</div>;
 }

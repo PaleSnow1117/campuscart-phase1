@@ -42,3 +42,26 @@ export type ListingFilters = {
   category?: ListingCategory | "All";
   query?: string;
 };
+
+export type Conversation = {
+  id: string;
+  listingId: string;
+  /** Snapshots so a conversation still renders if the listing changes. */
+  listingTitle: string;
+  listingPrice: number;
+  buyerId: string;
+  buyerName: string;
+  sellerId: string;
+  sellerName: string;
+  lastMessage: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type Message = {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  text: string;
+  createdAt: string;
+};
