@@ -1,0 +1,15 @@
+# Only the settings Route B needs. If you already ran `supabase init`, copy these
+# three blocks into your existing config.toml instead of replacing it.
+#
+# verify_jwt is OFF because these functions receive a FIREBASE ID token, which the
+# Supabase gateway cannot validate. Every function verifies the Firebase token itself
+# (see functions/_shared/auth.ts) before doing anything.
+
+[functions.submit-cor]
+verify_jwt = false
+
+[functions.get-cor-url]
+verify_jwt = false
+
+[functions.verify-cor]
+verify_jwt = false

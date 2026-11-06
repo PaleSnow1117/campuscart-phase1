@@ -1,0 +1,25 @@
+rules_version = '2';
+
+// UNTESTED draft for Phase 4A. Test in the Rules Playground before relying on it.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isAdmin() { return request.auth != null && request.auth.token.admin == true; }
+
+    // The COR is private: only the student can upload it, only admins can read it.
+    // There is no public URL and no read access for other students.
+    match /verification/{uid}/cor {
+      allow create, update: if request.auth != null && request.auth.uid == uid
+        && request.resource.size > 0
+        && request.resource.size <= 10 * 1024 * 1024
+        && request.resource.contentType.matches('application/pdf|image/jpeg|image/png');
+      allow read: if isAdmin();
+      // The student can delete their own upload so a failed signup can be undone.
+      allow delete: if (request.auth != null && request.auth.uid == uid) || isAdmin();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

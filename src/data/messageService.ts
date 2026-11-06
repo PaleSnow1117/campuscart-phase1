@@ -1,8 +1,26 @@
-import { formatSellerName } from "./listingService";
-import type { Conversation, Listing, Message, User } from "./types";
+import { isFirebaseConfigured } from "./firebase";
+import { firestoreMessages } from "./firestoreMarketplace";
+import { formatSellerName } from "./listingHelpers";
+import { localBus } from "./localBus";
+import type { Conversation, Listing, Message, Unsubscribe, User } from "./types";
+import { canUseMarketplace, verificationNotice } from "./verification";
 
-// Local-only messaging (Phase 3). Conversations and messages live in
-// localStorage; there is no networking, so nobody replies in real time.
+// Messaging. When Firebase is configured, conversations and messages live in Firestore and update live
+// (firestoreMarketplace.ts); nothing is read from or written to localStorage. Without Firebase (plain local
+// development) the original localStorage prototype below keeps working, with no live replies.
+
+type OnError = (error: unknown) => void;
+
+type MessageBackend = {
+  subscribeConversations(userId: string, onData: (items: Conversation[]) => void, onError: OnError): Unsubscribe;
+  subscribeConversation(conversationId: string, userId: string, onData: (item: Conversation | null) => void, onError: OnError): Unsubscribe;
+  subscribeMessages(conversationId: string, userId: string, onData: (items: Message[]) => void, onError: OnError): Unsubscribe;
+  getOrCreateConversation(listing: Listing, buyer: User | null): Promise<Conversation>;
+  send(conversationId: string, sender: User | null, text: string): Promise<void>;
+  syncUserName(user: User): Promise<void>;
+};
+
+// ---- local (localStorage) backend: used only when Firebase is not configured -----------------------------
 
 const CONVERSATIONS_KEY = "campuscart.conversations";
 const MESSAGES_KEY = "campuscart.messages";
@@ -54,25 +72,49 @@ function makeId(prefix: string): string {
 const isParticipant = (conversation: Conversation, userId: string) =>
   conversation.buyerId === userId || conversation.sellerId === userId;
 
-export const messageService = {
-  /** The signed-in user's conversations, most recently active first. */
-  getConversations(userId: string): Conversation[] {
-    return readConversations()
-      .filter((conversation) => isParticipant(conversation, userId))
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-  },
+/** Calls onData once (asynchronously) and again after every local change. */
+function localSubscribe<T>(read: () => T, onData: (value: T) => void, onError: OnError): Unsubscribe {
+  let active = true;
+  const emit = () => {
+    if (!active) return;
+    try { onData(read()); } catch (error) { onError(error); }
+  };
+  queueMicrotask(emit);
+  const off = localBus.subscribe(emit);
+  return () => { active = false; off(); };
+}
 
-  /** Returns undefined if it doesn't exist or the user isn't part of it. */
-  getConversation(conversationId: string | null | undefined, userId: string): Conversation | undefined {
-    if (!conversationId) return undefined;
-    return readConversations().find(
-      (conversation) => conversation.id === conversationId && isParticipant(conversation, userId),
-    );
-  },
+/** The signed-in user's conversations, most recently active first. */
+function localConversations(userId: string): Conversation[] {
+  return readConversations()
+    .filter((conversation) => isParticipant(conversation, userId))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+/** Undefined if it doesn't exist or the user isn't part of it. */
+function localConversation(conversationId: string, userId: string): Conversation | undefined {
+  return readConversations().find((conversation) => conversation.id === conversationId && isParticipant(conversation, userId));
+}
+
+/** Oldest first. Empty if the user isn't part of the conversation. */
+function localMessages(conversationId: string, userId: string): Message[] {
+  if (!localConversation(conversationId, userId)) return [];
+  return readMessages()
+    .filter((message) => message.conversationId === conversationId)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+const localBackend: MessageBackend = {
+  subscribeConversations: (userId, onData, onError) => localSubscribe(() => localConversations(userId), onData, onError),
+  subscribeConversation: (conversationId, userId, onData, onError) =>
+    localSubscribe(() => localConversation(conversationId, userId) ?? null, onData, onError),
+  subscribeMessages: (conversationId, userId, onData, onError) =>
+    localSubscribe(() => localMessages(conversationId, userId), onData, onError),
 
   /** One conversation per buyer + seller + listing; reuses it if it exists. */
-  getOrCreateConversation(listing: Listing, buyer: User | null): Conversation {
+  async getOrCreateConversation(listing, buyer) {
     if (!buyer) throw new Error("Please log in to message the seller.");
+    if (!canUseMarketplace(buyer)) throw new Error(verificationNotice(buyer));
     if (buyer.id === listing.sellerId) throw new Error("This is your own listing.");
     const conversations = readConversations();
     const existing = conversations.find(
@@ -97,19 +139,13 @@ export const messageService = {
       updatedAt: now,
     };
     writeList(CONVERSATIONS_KEY, [...conversations, conversation]);
+    localBus.notify();
     return conversation;
   },
 
-  /** Oldest first. Empty if the user isn't part of the conversation. */
-  getMessages(conversationId: string, userId: string): Message[] {
-    if (!this.getConversation(conversationId, userId)) return [];
-    return readMessages()
-      .filter((message) => message.conversationId === conversationId)
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  },
-
-  send(conversationId: string, sender: User | null, text: string): Message {
+  async send(conversationId, sender, text) {
     if (!sender) throw new Error("Please log in to send messages.");
+    if (!canUseMarketplace(sender)) throw new Error(verificationNotice(sender));
     const body = text.trim();
     if (!body) throw new Error("Please write a message first.");
     if (body.length > MAX_MESSAGE_LENGTH) throw new Error(`Messages can be up to ${MAX_MESSAGE_LENGTH} characters.`);
@@ -133,11 +169,11 @@ export const messageService = {
         entry.id === conversationId ? { ...entry, lastMessage: body, updatedAt: now } : entry,
       ),
     );
-    return message;
+    localBus.notify();
   },
 
   /** Keeps stored names in step when a user edits their full name. */
-  syncUserName(user: User): void {
+  async syncUserName(user) {
     const name = formatSellerName(user.fullName);
     const conversations = readConversations();
     const stale = (c: Conversation) =>
@@ -151,7 +187,36 @@ export const messageService = {
         sellerName: c.sellerId === user.id ? name : c.sellerName,
       })),
     );
+    localBus.notify();
   },
+};
+
+// ---- public API ----------------------------------------------------------------------------------------------
+
+const firestoreBackend: MessageBackend = {
+  subscribeConversations: firestoreMessages.subscribeConversations,
+  // Firestore reads are decided by the security rules, so the user id is not needed here.
+  subscribeConversation: (conversationId, _userId, onData, onError) => firestoreMessages.subscribeConversation(conversationId, onData, onError),
+  subscribeMessages: (conversationId, _userId, onData, onError) => firestoreMessages.subscribeMessages(conversationId, onData, onError),
+  getOrCreateConversation: firestoreMessages.getOrCreateConversation,
+  send: firestoreMessages.send,
+  syncUserName: firestoreMessages.syncUserName,
+};
+
+const backend: MessageBackend = isFirebaseConfigured ? firestoreBackend : localBackend;
+
+export const messageService = {
+  /** Live list of the signed-in user's conversations. */
+  subscribeConversations: backend.subscribeConversations,
+  /** Live single conversation; calls back with null if it doesn't exist or isn't yours. */
+  subscribeConversation: backend.subscribeConversation,
+  /** Live messages of one conversation, oldest first. */
+  subscribeMessages: backend.subscribeMessages,
+  /** One conversation per buyer + seller + listing. */
+  getOrCreateConversation: backend.getOrCreateConversation,
+  /** Sends a message. It appears through the subscription (immediately, even before the server confirms). */
+  send: backend.send,
+  syncUserName: backend.syncUserName,
 };
 
 /** Other person's display name from the viewer's point of view. */

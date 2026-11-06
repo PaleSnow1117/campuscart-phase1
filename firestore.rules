@@ -1,0 +1,265 @@
+rules_version = '2';
+
+// CampusCart Firestore rules.
+//  - users / admins / attestors: student verification and admin review (unchanged by the marketplace work).
+//  - listings, users/{uid}/saved, conversations, messages: server-backed marketplace. Verification is enforced
+//    from the SERVER-SIDE profile (users/{uid}.verificationStatus), which students cannot change.
+// Rules cannot see Supabase Storage, so they cannot check that a COR file exists; that is the job of the
+// verify-cor Edge Function plus the corVerifiedAt field (see adminReview below).
+// Run rules-tests/*.test.mjs in the emulator before publishing (see FIREBASE_SETUP.md).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+
+    // Admin and attestor power come from documents that ONLY the Firebase Console (or the Admin SDK) can
+    // create. No client write is ever allowed on those collections (see below).
+    function isAdmin() {
+      return signedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+    function isAttestor() {
+      return signedIn() && exists(/databases/$(database)/documents/attestors/$(request.auth.uid));
+    }
+
+    function shortText(value, maxLength) {
+      return value is string && value.size() > 0 && value.size() <= maxLength;
+    }
+
+    // Signup: the student creates their own profile, always as "pending", with no review data.
+    function validNewProfile(uid) {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['fullName', 'username', 'email', 'studentNumber', 'campus',
+                               'verificationStatus', 'corStoragePath', 'createdAt', 'verifiedAt'])
+        && d.keys().hasAll(['fullName', 'username', 'email', 'studentNumber', 'campus',
+                            'verificationStatus', 'corStoragePath', 'createdAt', 'verifiedAt'])
+        && shortText(d.fullName, 100)
+        && shortText(d.username, 50)
+        && shortText(d.studentNumber, 30)
+        && shortText(d.campus, 100)
+        && shortText(d.email, 254)
+        && d.email.lower() == request.auth.token.email.lower()
+        && d.verificationStatus == 'pending'
+        && d.verifiedAt == null
+        && d.corStoragePath == uid + '/cor'
+        && d.createdAt == request.time;
+    }
+
+    // A student may edit only these three fields. Everything else (status, COR path, timestamps,
+    // student number, email) is untouchable by them.
+    function studentEdit(uid) {
+      let d = request.resource.data;
+      return isOwner(uid)
+        && d.diff(resource.data).affectedKeys().hasOnly(['fullName', 'username', 'campus'])
+        && shortText(d.fullName, 100)
+        && shortText(d.username, 50)
+        && shortText(d.campus, 100);
+    }
+
+    // The admin may change only the decision fields. Approval also requires corVerifiedAt, which only the
+    // attestor account (driven by the verify-cor Edge Function) can set.
+    function adminReview() {
+      let d = request.resource.data;
+      return isAdmin()
+        && d.diff(resource.data).affectedKeys().hasOnly(['verificationStatus', 'verifiedAt', 'reviewedAt'])
+        && d.reviewedAt == request.time
+        && ((d.verificationStatus == 'approved'
+             && d.verifiedAt == request.time
+             && resource.data.get('corVerifiedAt', null) != null)
+            || (d.verificationStatus == 'rejected'
+                && d.verifiedAt == null));
+    }
+
+    // The attestor may set exactly one field, nothing else.
+    function attestorMark() {
+      let d = request.resource.data;
+      return isAttestor()
+        && d.diff(resource.data).affectedKeys().hasOnly(['corVerifiedAt'])
+        && d.corVerifiedAt is timestamp;
+    }
+
+
+    // ---------------------------------------------------------------------------------------------------
+    // Marketplace helpers
+    // ---------------------------------------------------------------------------------------------------
+
+    // The caller's own profile. Fails (so the rule denies) if the profile does not exist.
+    function userProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Verification comes from the server-side profile. Students cannot change verificationStatus (see
+    // studentEdit), and no client-supplied "verified" or "admin" flag is ever trusted.
+    function isVerified() {
+      return signedIn() && userProfile().verificationStatus == 'approved';
+    }
+
+    // A display name must start with the real first name from the caller's profile, so nobody can post
+    // listings or messages under someone else's name. (The last initial is not enforced.)
+    function nameMatchesProfile(displayName) {
+      return shortText(displayName, 60)
+        && displayName.split(' ')[0].lower() == userProfile().fullName.split(' ')[0].lower();
+    }
+
+    // ---- listings ----
+    function validImageAt(images, i) {
+      return images.size() <= i || (images[i] is string && images[i].size() <= 750000);
+    }
+
+    function validListingFields(d) {
+      return shortText(d.title, 120)
+        && d.price is number && d.price >= 0 && d.price <= 1000000000
+        && d.condition in ['Good as new', 'Brand new', 'Lightly used']
+        && d.category in ['Books', 'Uniforms', 'Food', 'Other']
+        && shortText(d.description, 2000)
+        && d.images is list && d.images.size() <= 5
+        && validImageAt(d.images, 0) && validImageAt(d.images, 1) && validImageAt(d.images, 2)
+        && validImageAt(d.images, 3) && validImageAt(d.images, 4);
+    }
+
+    // The seller is the signed-in user, the name and campus come from their server-side profile.
+    function validNewListing(listingId) {
+      let d = request.resource.data;
+      return listingId.matches('^[A-Za-z0-9]{1,64}$')
+        && d.keys().hasOnly(['title', 'price', 'condition', 'category', 'description', 'sellerId',
+                             'sellerName', 'images', 'campus', 'createdAt'])
+        && d.keys().hasAll(['title', 'price', 'condition', 'category', 'description', 'sellerId',
+                            'sellerName', 'images', 'campus', 'createdAt'])
+        && validListingFields(d)
+        && d.sellerId == request.auth.uid
+        && nameMatchesProfile(d.sellerName)
+        && d.campus == userProfile().campus
+        && d.createdAt == request.time;
+    }
+
+    // sellerId, campus and createdAt can never change.
+    function validListingEdit() {
+      let d = request.resource.data;
+      return d.diff(resource.data).affectedKeys()
+               .hasOnly(['title', 'price', 'condition', 'category', 'description', 'images', 'sellerName'])
+        && validListingFields(d)
+        && (d.sellerName == resource.data.sellerName || nameMatchesProfile(d.sellerName));
+    }
+
+    // ---- conversations and messages ----
+    // The conversation id is listingId_buyerUid, so there can only ever be ONE conversation per listing and
+    // buyer, and the seller is always the listing's own seller (taken from the listing, never from the client).
+    function validNewConversation(conversationId) {
+      let d = request.resource.data;
+      let listing = get(/databases/$(database)/documents/listings/$(d.listingId)).data;
+      return d.keys().hasOnly(['listingId', 'listingTitle', 'listingPrice', 'buyerId', 'buyerName', 'sellerId',
+                               'sellerName', 'participants', 'lastMessage', 'lastMessageId', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['listingId', 'listingTitle', 'listingPrice', 'buyerId', 'buyerName', 'sellerId',
+                            'sellerName', 'participants', 'lastMessage', 'lastMessageId', 'createdAt', 'updatedAt'])
+        && conversationId == d.listingId + '_' + d.buyerId
+        && d.buyerId == request.auth.uid
+        && d.sellerId == listing.sellerId
+        && d.sellerId != d.buyerId
+        && d.listingTitle == listing.title
+        && d.listingPrice == listing.price
+        && d.sellerName == listing.sellerName
+        && nameMatchesProfile(d.buyerName)
+        && d.participants == [d.buyerId, d.sellerId]
+        && d.lastMessage == ''
+        && d.lastMessageId == ''
+        && d.createdAt == request.time
+        && d.updatedAt == request.time;
+    }
+
+    // The latest-message fields may only change together with a real message written in the SAME batch.
+    function validLastMessageUpdate(conversationId) {
+      let d = request.resource.data;
+      return d.diff(resource.data).affectedKeys().hasOnly(['lastMessage', 'lastMessageId', 'updatedAt'])
+        && d.updatedAt == request.time
+        && shortText(d.lastMessage, 1000)
+        && d.lastMessageId.matches('^[A-Za-z0-9]{1,64}$')
+        && isVerified()
+        && getAfter(/databases/$(database)/documents/conversations/$(conversationId)/messages/$(d.lastMessageId)).data.text == d.lastMessage
+        && getAfter(/databases/$(database)/documents/conversations/$(conversationId)/messages/$(d.lastMessageId)).data.senderId == request.auth.uid;
+    }
+
+    // A participant may refresh their OWN display name. Participants, listing and ids can never change.
+    function validOwnNameChange() {
+      let d = request.resource.data;
+      let changed = d.diff(resource.data).affectedKeys();
+      return (changed.hasOnly(['buyerName']) && resource.data.buyerId == request.auth.uid && nameMatchesProfile(d.buyerName))
+        || (changed.hasOnly(['sellerName']) && resource.data.sellerId == request.auth.uid && nameMatchesProfile(d.sellerName));
+    }
+
+    function validNewMessage(conversationId, messageId) {
+      let d = request.resource.data;
+      return messageId.matches('^[A-Za-z0-9]{1,64}$')
+        && d.keys().hasOnly(['conversationId', 'senderId', 'text', 'createdAt'])
+        && d.keys().hasAll(['conversationId', 'senderId', 'text', 'createdAt'])
+        && d.conversationId == conversationId
+        && d.senderId == request.auth.uid
+        && shortText(d.text, 1000)
+        && d.text.trim().size() > 0
+        && d.createdAt == request.time
+        && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
+    }
+
+    match /admins/{uid} {
+      allow get: if isOwner(uid);           // you can only ask "am I an admin?" about yourself
+      allow list, create, update, delete: if false;
+    }
+
+    match /attestors/{uid} {
+      allow read, write: if false;
+    }
+
+    match /users/{uid} {
+      allow get: if isOwner(uid) || isAdmin();
+      allow list: if isAdmin();
+      allow create: if isOwner(uid) && validNewProfile(uid);
+      allow update: if studentEdit(uid) || adminReview() || attestorMark();
+      allow delete: if false;
+
+      // Saved listings: private to their owner. Pending and rejected students may save (they can browse).
+      match /saved/{listingId} {
+        allow get, list: if isOwner(uid);
+        allow create, update: if isOwner(uid)
+          && request.resource.data.keys().hasOnly(['listingId', 'savedAt'])
+          && request.resource.data.keys().hasAll(['listingId', 'savedAt'])
+          && request.resource.data.listingId == listingId
+          && request.resource.data.savedAt == request.time
+          && exists(/databases/$(database)/documents/listings/$(listingId));
+        allow delete: if isOwner(uid);
+      }
+    }
+
+    // Listings: any signed-in user can browse. Only VERIFIED students can post or edit, and only the owner can
+    // edit or delete. (To allow public browsing, change the read rule to `if true`.)
+    match /listings/{listingId} {
+      allow get, list: if signedIn();
+      allow create: if isVerified() && validNewListing(listingId);
+      allow update: if signedIn() && resource.data.sellerId == request.auth.uid && isVerified() && validListingEdit();
+      allow delete: if signedIn() && resource.data.sellerId == request.auth.uid;
+    }
+
+    // Conversations: only the buyer and the seller. Administrators get no special access.
+    match /conversations/{conversationId} {
+      // Reading a conversation that does not exist yet is only allowed for an id that ends with YOUR uid
+      // (so a buyer can check for an existing conversation, and nobody can probe other people's).
+      allow get: if signedIn() && (resource == null
+        ? conversationId.matches('^[A-Za-z0-9]{1,64}_' + request.auth.uid + '$')
+        : request.auth.uid in resource.data.participants);
+      allow list: if signedIn() && request.auth.uid in resource.data.participants;
+      allow create: if isVerified() && validNewConversation(conversationId);
+      allow update: if signedIn() && request.auth.uid in resource.data.participants
+        && (validOwnNameChange() || validLastMessageUpdate(conversationId));
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow get, list: if signedIn()
+          && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
+        allow create: if isVerified() && validNewMessage(conversationId, messageId);
+        allow update, delete: if false;
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

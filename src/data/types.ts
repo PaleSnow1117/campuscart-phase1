@@ -1,3 +1,5 @@
+export type VerificationStatus = "pending" | "approved" | "rejected";
+
 export type User = {
   id: string;
   fullName: string;
@@ -5,7 +7,18 @@ export type User = {
   email: string;
   campus: string;
   createdAt: string;
+  /* Student verification (Firebase accounts). All optional so the local
+     prototype accounts from Phases 2-3.5 keep working untouched. */
+  studentNumber?: string;
+  verificationStatus?: VerificationStatus;
+  /** Path of the private COR in Firebase Storage (never a download URL). */
+  corStoragePath?: string | null;
+  verifiedAt?: string | null;
+  /** When the administrator approved or rejected the request. */
+  reviewedAt?: string | null;
 };
+
+export const DEFAULT_CAMPUS = "URS Binangonan";
 
 export const LISTING_CATEGORIES = ["Books", "Uniforms", "Food", "Other"] as const;
 export type ListingCategory = (typeof LISTING_CATEGORIES)[number];
@@ -32,7 +45,7 @@ export type Listing = {
   description: string;
   sellerId: string;
   sellerName: string;
-  /** Data URLs (local-only for now). */
+  /** Data URLs stored inside the listing document (at most 5, about 900 KB in total). */
   images: string[];
   campus: string;
   createdAt: string;
@@ -74,3 +87,6 @@ export type Message = {
   text: string;
   createdAt: string;
 };
+
+/** Stops a live subscription. */
+export type Unsubscribe = () => void;

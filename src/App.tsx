@@ -1,9 +1,15 @@
 import { type ChangeEvent, type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import { authService } from "./data/authService";
+import { COR_ACCEPT, COR_MAX_LABEL, validateCorFile } from "./data/corService";
+import { isFirebaseConfigured } from "./data/firebase";
+import { describeFirebaseError } from "./data/firebaseErrors";
+import { firebaseAuthService } from "./data/firebaseAuthService";
+import { adminService, type PendingStudent } from "./data/adminService";
 import { imageService, MAX_IMAGES } from "./data/imageService";
 import { artKind, formatPostedAt, formatPrice, listingService, parsePrice, savedService } from "./data/listingService";
 import { formatConversationTime, formatDayLabel, formatMessageTime, initialsOf, messageService, otherPartyName } from "./data/messageService";
-import { CAMPUSES, LISTING_CATEGORIES, LISTING_CONDITIONS, type Listing, type ListingCategory, type ListingCondition, type Message, type ProfileChanges, type User } from "./data/types";
+import { canUseMarketplace, verificationLabel, verificationNotice } from "./data/verification";
+import { CAMPUSES, LISTING_CATEGORIES, LISTING_CONDITIONS, type Listing, type ListingCategory, type ListingCondition, type Conversation, type Message, type ProfileChanges, type User } from "./data/types";
 
 type Route =
   | "welcome"
@@ -20,7 +26,8 @@ type Route =
   | "edit"
   | "campus"
   | "account"
-  | "help";
+  | "help"
+  | "admin";
 
 type IconName =
   | "arrow"
@@ -62,17 +69,31 @@ const pathToRoute: Record<string, Route> = {
   "/campus": "campus",
   "/account": "account",
   "/help": "help",
+  "/admin": "admin",
 };
 
 const routeToPath: Record<Route, string> = Object.fromEntries(
   Object.entries(pathToRoute).map(([path, route]) => [route, path]),
 ) as Record<Route, string>;
 
-type GoFn = (route: Route, listingId?: string) => void;
+type GoFn = (route: Route, listingId?: string, actingUser?: User | null) => void;
+
+// Firebase accounts replace the local prototype accounts when the env vars are set.
+const firebaseMode = isFirebaseConfigured;
+
+const NO_LISTINGS: Listing[] = [];
+const NO_IDS: string[] = [];
+
+/** Where a server-backed list is: still loading, ready, failed, or (Firebase mode) nobody is signed in. */
+type DataStatus = "loading" | "ready" | "error" | "signedOut";
+type DataInfo = { status: DataStatus; error: string | null; retry: () => void };
 
 // Screens that need a signed-in user (profile as in Phase 1; create needs a seller ID; messages belong to an account).
-const protectedRoutes: Route[] = ["profile", "create", "messages", "chat", "mylistings", "edit", "campus", "account", "help"];
+const protectedRoutes: Route[] = ["profile", "create", "messages", "chat", "mylistings", "edit", "campus", "account", "help", "admin"];
 const guard = (route: Route, user: User | null): Route => (protectedRoutes.includes(route) && !user ? "login" : route);
+// In Firebase mode the signed-in user is only known after Firebase reports it, so guarding happens
+// at render time instead (protected screens show login when there is no user).
+const initialGuard = (route: Route): Route => (firebaseMode ? route : guard(route, authService.getCurrentUser()));
 
 function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, ReactNode> = {
@@ -137,6 +158,13 @@ function ProductArt({ kind, large = false, image }: { kind: string; large?: bool
   return <div className={`product-art ${large ? "large" : ""} art-${kind}`}><span className="art-label">URS</span><Icon name={kind === "book" ? "book" : kind === "uniform" ? "uniform" : "plus"} size={large ? 92 : 54} /></div>;
 }
 
+/** Loading, error and signed-out messages for server-backed lists, in the existing empty-state style. */
+function DataNotice({ info, go, what }: { info: DataInfo; go: GoFn; what: string }) {
+  if (info.status === "loading") return <p className="description">Loading {what}...</p>;
+  if (info.status === "signedOut") return <div className="empty-state"><span><Icon name="shield" size={33} /></span><h2>Log in to see {what}</h2><p>CampusCart is shared with signed-in campus students.</p><button className="primary-button" type="button" onClick={() => go("login")}>Log in</button></div>;
+  return <div className="empty-state"><span><Icon name="search" size={33} /></span><h2>Couldn&apos;t load {what}</h2><p>{info.error ?? "Something went wrong."}</p><button className="primary-button" type="button" onClick={info.retry}>Try again</button></div>;
+}
+
 function ListingCard({ listing, saved, toggleSaved, go }: { listing: Listing; saved: boolean; toggleSaved: (id: string) => void; go: GoFn }) {
   return (
     <article className="listing-card">
@@ -149,7 +177,7 @@ function ListingCard({ listing, saved, toggleSaved, go }: { listing: Listing; sa
   );
 }
 
-function HomeScreen({ go, listings, saved, toggleSaved }: { go: GoFn; listings: Listing[]; saved: string[]; toggleSaved: (id: string) => void }) {
+function HomeScreen({ go, listings, info, saved, toggleSaved }: { go: GoFn; listings: Listing[]; info: DataInfo; saved: string[]; toggleSaved: (id: string) => void }) {
   const [category, setCategory] = useState<ListingCategory | "All">("All");
   const [search, setSearch] = useState("");
   const filteredListings = listingService.filter(listings, { category, query: search });
@@ -184,9 +212,9 @@ function HomeScreen({ go, listings, saved, toggleSaved }: { go: GoFn; listings: 
           {(["All", "Books", "Uniforms", "Food"] as const).map((item) => <button className={category === item ? "selected" : ""} key={item} type="button" onClick={() => setCategory(item)}>{item}</button>)}
         </div>
 
-        <div className="listing-grid">
+        {info.status !== "ready" ? <DataNotice info={info} go={go} what="listings" /> : listings.length === 0 ? <div className="empty-state"><span><Icon name="uniform" size={33} /></span><h2>No listings yet</h2><p>Be the first to list something for students nearby.</p><button className="primary-button" type="button" onClick={() => go("create")}>List an item</button></div> : <div className="listing-grid">
           {filteredListings.map((listing) => <ListingCard key={listing.id} listing={listing} saved={saved.includes(listing.id)} toggleSaved={toggleSaved} go={go} />)}
-        </div>
+        </div>}
       </section>
     </main>
 
@@ -205,132 +233,190 @@ function WelcomeScreen({ go }: { go: (route: Route) => void }) {
 
 function AuthScreen({ mode, go, onAuthenticated }: { mode: "login" | "signup"; go: (route: Route) => void; onAuthenticated: (user: User) => void }) {
   const [error, setError] = useState("");
-  const submit = (event: FormEvent<HTMLFormElement>) => {
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (busy) return;
     setError("");
     const fields = new FormData(event.currentTarget);
+    const password = String(fields.get("password") ?? "");
     try {
-      const username = String(fields.get("username") ?? "");
-      const password = String(fields.get("password") ?? "");
-      const user = mode === "login"
-        ? authService.login(username, password)
-        : authService.signUp({
+      let user: User;
+      if (firebaseMode) {
+        const email = String(fields.get("email") ?? "");
+        if (mode === "signup") {
+          const picked = fields.get("cor");
+          const corFile = picked instanceof File && picked.name ? picked : null;
+          const problem = validateCorFile(corFile);
+          if (problem) { setError(problem); return; }
+          setBusy(true);
+          user = await firebaseAuthService.signUp({
             fullName: String(fields.get("fullName") ?? ""),
-            username,
-            email: String(fields.get("email") ?? ""),
-            password,
+            username: String(fields.get("username") ?? ""),
+            studentNumber: String(fields.get("studentNumber") ?? ""),
+            email, password, corFile,
           });
+        } else {
+          setBusy(true);
+          user = await firebaseAuthService.login(email, password);
+        }
+      } else {
+        const username = String(fields.get("username") ?? "");
+        user = mode === "login"
+          ? authService.login(username, password)
+          : authService.signUp({
+              fullName: String(fields.get("fullName") ?? ""),
+              username,
+              email: String(fields.get("email") ?? ""),
+              password,
+            });
+      }
       onAuthenticated(user);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Unable to save your account. Please try again.");
+      setError(firebaseMode ? describeFirebaseError(cause) : cause instanceof Error ? cause.message : "Unable to save your account. Please try again.");
+    } finally {
+      setBusy(false);
     }
   };
   const login = mode === "login";
+  const unavailable = firebaseMode ? "is not available yet." : "is not available for local accounts.";
   return <div className="screen auth-screen"><Topbar go={go} back="welcome" title={login ? "Login" : "Create account"} /><main className="auth-content"><div className="auth-mark"><Icon name={login ? "profile" : "cart"} size={29} /></div><p className="under-label">{login ? "WELCOME BACK TO CAMPUSCART" : "JOIN YOUR CAMPUS MARKETPLACE"}</p><h2>{login ? "Good to see you again." : "Start finding good things."}</h2><p className="auth-intro">{login ? "Login to continue buying and selling with students nearby." : "Create your account and keep your campus finds close."}</p><form onSubmit={submit}>
     {!login && <label>Full Name<input required name="fullName" placeholder="Enter your full name" /></label>}
-    <label>Username<input required name="username" placeholder="Enter your username" /></label>
+    {login && firebaseMode ? <label>Email<input required name="email" type="email" placeholder="name@urs.edu.ph" /></label> : <label>Username<input required name="username" placeholder="Enter your username" /></label>}
+    {!login && firebaseMode && <label>Student Number<input required name="studentNumber" placeholder="Enter your student number" autoComplete="off" /></label>}
     {!login && <label>Campus Email<input required name="email" type="email" placeholder="name@urs.edu.ph" /></label>}
     <label>Password<input required name="password" type="password" placeholder="Enter your password" /></label>
-    {login && <div className="form-options"><label className="check-label"><input type="checkbox" /> <span>Remember Me</span></label><button type="button" onClick={() => setError("Password recovery is not available for local accounts.")}>Forgot Password?</button></div>}
+    {!login && firebaseMode && <label>Certificate of Registration (COR)<input required name="cor" type="file" accept={COR_ACCEPT} style={{ paddingTop: 11 }} /><small style={{ fontWeight: 500, color: "#6e788b", fontSize: 10 }}>PDF, JPG or PNG, up to {COR_MAX_LABEL}. It is used only to verify you are a student, and is kept private.</small></label>}
+    {login && <div className="form-options"><label className="check-label"><input type="checkbox" /> <span>Remember Me</span></label><button type="button" onClick={() => setError(`Password recovery ${unavailable}`)}>Forgot Password?</button></div>}
     {error && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11 }}>{error}</p>}
-    <button className="primary-button wide" type="submit">{login ? "Login" : "Sign up"} <Icon name="arrow" size={17} /></button>
-  </form>{login && <div className="continue"><span>Continue With</span><button type="button" onClick={() => setError("Google login is not available for local accounts.")}>G&nbsp;&nbsp; Google</button></div>}<p className="account-prompt">{login ? "Don't Have An Account? " : "Already have an account? "}<button type="button" onClick={() => go(login ? "signup" : "login")}>{login ? "Sign up" : "Login"}</button></p></main></div>;
+    <button className="primary-button wide" type="submit" disabled={busy}>{busy ? "Please wait..." : login ? "Login" : "Sign up"} <Icon name="arrow" size={17} /></button>
+  </form>{login && <div className="continue"><span>Continue With</span><button type="button" onClick={() => setError(`Google login ${unavailable}`)}>G&nbsp;&nbsp; Google</button></div>}<p className="account-prompt">{login ? "Don't Have An Account? " : "Already have an account? "}<button type="button" onClick={() => go(login ? "signup" : "login")}>{login ? "Sign up" : "Login"}</button></p></main></div>;
 }
 
-function ProductScreen({ go, item, saved, toggleSaved, onMessageSeller }: { go: GoFn; item?: Listing; saved: string[]; toggleSaved: (id: string) => void; onMessageSeller: (listing: Listing) => string | null }) {
+function ProductScreen({ go, item, info, saved, toggleSaved, onMessageSeller }: { go: GoFn; item?: Listing; info: DataInfo; saved: string[]; toggleSaved: (id: string) => void; onMessageSeller: (listing: Listing) => Promise<string | null> }) {
   const [photo, setPhoto] = useState(0);
   const [notice, setNotice] = useState("");
+  const [opening, setOpening] = useState(false);
+  if (!item && info.status !== "ready") return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main className="page-content"><DataNotice info={info} go={go} what="this listing" /></main></div>;
   if (!item) return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main className="page-content"><div className="empty-state"><span><Icon name="search" size={33} /></span><h2>Listing not found</h2><p>This item may have been removed.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div></main></div>;
   const isSaved = saved.includes(item.id);
   const photos = item.images.length;
   const initials = item.sellerName.split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("");
-  return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main><div className="detail-art" onClick={() => photos > 1 && setPhoto((photo + 1) % photos)}><ProductArt kind={artKind(item.category)} image={item.images[photo % Math.max(photos, 1)]} large /><button className={`save-button detail-save ${isSaved ? "is-saved" : ""}`} type="button" onClick={(event) => { event.stopPropagation(); toggleSaved(item.id); }}><Icon name="heart" /></button><span className="photo-count">{(photo % Math.max(photos, 1)) + 1} / {Math.max(photos, 1)}</span></div><div className="detail-info"><div className="condition-row"><span>{item.condition}</span><small>{formatPostedAt(item.createdAt)}</small></div><h2>{item.title}</h2><strong className="detail-price">{formatPrice(item.price)}</strong><div className="seller-box"><span className="seller-avatar">{initials}</span><div><small>SELLER</small><strong>{item.sellerName}</strong><p><Icon name="location" size={12} /> {item.campus} Campus</p></div><Icon name="chevron" /></div><h3>About this item</h3><p className="description">{item.description}</p>{notice && <p role="alert" style={{ margin: "0 0 10px", color: "#b13a3a", fontSize: 11 }}>{notice}</p>}<div className="safety-note"><Icon name="shield" /><p><strong>Buy safely on campus</strong><br />Meet in a public campus area and inspect the item before paying.</p></div></div></main><div className="detail-actions"><button className="outline-button" type="button" onClick={() => toggleSaved(item.id)}><Icon name="heart" size={18} /> Save</button><button className="primary-button" type="button" onClick={() => setNotice(onMessageSeller(item) ?? "")}><Icon name="chat" size={18} /> Message seller</button></div></div>;
+  return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main><div className="detail-art" onClick={() => photos > 1 && setPhoto((photo + 1) % photos)}><ProductArt kind={artKind(item.category)} image={item.images[photo % Math.max(photos, 1)]} large /><button className={`save-button detail-save ${isSaved ? "is-saved" : ""}`} type="button" onClick={(event) => { event.stopPropagation(); toggleSaved(item.id); }}><Icon name="heart" /></button><span className="photo-count">{(photo % Math.max(photos, 1)) + 1} / {Math.max(photos, 1)}</span></div><div className="detail-info"><div className="condition-row"><span>{item.condition}</span><small>{formatPostedAt(item.createdAt)}</small></div><h2>{item.title}</h2><strong className="detail-price">{formatPrice(item.price)}</strong><div className="seller-box"><span className="seller-avatar">{initials}</span><div><small>SELLER</small><strong>{item.sellerName}</strong><p><Icon name="location" size={12} /> {item.campus} Campus</p></div><Icon name="chevron" /></div><h3>About this item</h3><p className="description">{item.description}</p>{notice && <p role="alert" style={{ margin: "0 0 10px", color: "#b13a3a", fontSize: 11 }}>{notice}</p>}<div className="safety-note"><Icon name="shield" /><p><strong>Buy safely on campus</strong><br />Meet in a public campus area and inspect the item before paying.</p></div></div></main><div className="detail-actions"><button className="outline-button" type="button" onClick={() => toggleSaved(item.id)}><Icon name="heart" size={18} /> Save</button><button className="primary-button" type="button" disabled={opening} onClick={() => { setOpening(true); onMessageSeller(item).then((message) => setNotice(message ?? "")).finally(() => setOpening(false)); }}><Icon name="chat" size={18} /> Message seller</button></div></div>;
 }
 
-function SavedScreen({ go, listings, saved, toggleSaved }: { go: GoFn; listings: Listing[]; saved: string[]; toggleSaved: (id: string) => void }) {
+function SavedScreen({ go, listings, info, saved, toggleSaved }: { go: GoFn; listings: Listing[]; info: DataInfo; saved: string[]; toggleSaved: (id: string) => void }) {
   const items = listings.filter((item) => saved.includes(item.id));
-  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content"><p className="section-kicker">YOUR SHORTLIST</p><h1>Saved <em>finds.</em></h1>{items.length ? <div className="listing-grid saved-grid">{items.map((listing) => <ListingCard key={listing.id} listing={listing} saved toggleSaved={toggleSaved} go={go} />)}</div> : <div className="empty-state"><span><Icon name="heart" size={33} /></span><h2>No saved finds yet</h2><p>Tap the heart on anything you want to come back to.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div>}</main><BottomNav current="saved" go={go} /></div>;
+  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content"><p className="section-kicker">YOUR SHORTLIST</p><h1>Saved <em>finds.</em></h1>{info.status !== "ready" ? <DataNotice info={info} go={go} what="saved finds" /> : items.length ? <div className="listing-grid saved-grid">{items.map((listing) => <ListingCard key={listing.id} listing={listing} saved toggleSaved={toggleSaved} go={go} />)}</div> : <div className="empty-state"><span><Icon name="heart" size={33} /></span><h2>No saved finds yet</h2><p>Tap the heart on anything you want to come back to.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div>}</main><BottomNav current="saved" go={go} /></div>;
 }
 
 function MessagesScreen({ go, user }: { go: GoFn; user: User }) {
-  const [conversations] = useState(() => messageService.getConversations(user.id));
+  const [state, setState] = useState<{ items: Conversation[] | null; error: string | null }>({ items: null, error: null });
+  const [attempt, setAttempt] = useState(0);
   const [search, setSearch] = useState("");
+  useEffect(() => messageService.subscribeConversations(
+    user.id,
+    (items) => setState({ items, error: null }),
+    (cause) => setState({ items: null, error: describeFirebaseError(cause) }),
+  ), [user.id, attempt]);
+  const conversations = state.items ?? [];
   const text = search.toLowerCase().trim();
   const visible = conversations.filter((conversation) => !text || [otherPartyName(conversation, user.id), conversation.listingTitle, conversation.lastMessage].some((field) => field.toLowerCase().includes(text)));
-  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content"><p className="section-kicker">CAMPUS CONVERSATIONS</p><h1>Your <em>messages.</em></h1><label className="search-box message-search"><Icon name="search" size={17} /><input aria-label="Search messages" placeholder="Search messages" value={search} onChange={(event) => setSearch(event.target.value)} /></label>{conversations.length === 0 ? <div className="empty-state"><span><Icon name="chat" size={33} /></span><h2>No messages yet</h2><p>Open a listing and tap Message seller to start a conversation.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div> : visible.length === 0 ? <div className="empty-state"><h2>No matches</h2><p>Try a different name, item or word.</p></div> : visible.map((conversation, index) => { const name = otherPartyName(conversation, user.id); return <button key={conversation.id} className="conversation" type="button" onClick={() => go("chat", conversation.id)}><span className={`seller-avatar ${index % 2 ? "gold" : ""}`}>{initialsOf(name)}</span><span className="conversation-copy"><strong>{name}</strong><small>{conversation.listingTitle}</small><p>{conversation.lastMessage || "No messages yet. Say hi!"}</p></span><span className="conversation-meta"><small>{formatConversationTime(conversation.updatedAt)}</small></span></button>; })}</main><BottomNav current="messages" go={go} /></div>;
+  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content"><p className="section-kicker">CAMPUS CONVERSATIONS</p><h1>Your <em>messages.</em></h1><label className="search-box message-search"><Icon name="search" size={17} /><input aria-label="Search messages" placeholder="Search messages" value={search} onChange={(event) => setSearch(event.target.value)} /></label>{state.error ? <DataNotice info={{ status: "error", error: state.error, retry: () => { setState({ items: null, error: null }); setAttempt((n) => n + 1); } }} go={go} what="messages" /> : state.items === null ? <p className="description">Loading messages...</p> : conversations.length === 0 ? <div className="empty-state"><span><Icon name="chat" size={33} /></span><h2>No messages yet</h2><p>Open a listing and tap Message seller to start a conversation.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div> : visible.length === 0 ? <div className="empty-state"><h2>No matches</h2><p>Try a different name, item or word.</p></div> : visible.map((conversation, index) => { const name = otherPartyName(conversation, user.id); return <button key={conversation.id} className="conversation" type="button" onClick={() => go("chat", conversation.id)}><span className={`seller-avatar ${index % 2 ? "gold" : ""}`}>{initialsOf(name)}</span><span className="conversation-copy"><strong>{name}</strong><small>{conversation.listingTitle}</small><p>{conversation.lastMessage || "No messages yet. Say hi!"}</p></span><span className="conversation-meta"><small>{formatConversationTime(conversation.updatedAt)}</small></span></button>; })}</main><BottomNav current="messages" go={go} /></div>;
 }
 
 function ChatScreen({ go, user, conversationId, listings }: { go: GoFn; user: User; conversationId: string | null; listings: Listing[] }) {
-  const conversation = messageService.getConversation(conversationId, user.id);
-  const [messages, setMessages] = useState<Message[]>(() => (conversationId ? messageService.getMessages(conversationId, user.id) : []));
+  const [state, setState] = useState<{ conversation: Conversation | null | undefined; messages: Message[] | null; error: string | null }>({ conversation: undefined, messages: null, error: null });
+  const [attempt, setAttempt] = useState(0);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
   const bottom = useRef<HTMLDivElement>(null);
-  useEffect(() => { bottom.current?.scrollIntoView({ block: "end" }); }, [messages]);
-  if (!conversation) return <div className="screen nav-screen"><Topbar go={go} back="messages" title="Conversation" /><main className="page-content"><div className="empty-state"><span><Icon name="chat" size={33} /></span><h2>Conversation not found</h2><p>It may not exist, or it belongs to another account.</p><button className="primary-button" type="button" onClick={() => go("messages")}>Back to messages</button></div></main></div>;
+  useEffect(() => {
+    if (!conversationId) return;
+    const offConversation = messageService.subscribeConversation(
+      conversationId, user.id,
+      (conversation) => setState((current) => ({ ...current, conversation })),
+      (cause) => setState((current) => ({ ...current, error: describeFirebaseError(cause) })),
+    );
+    const offMessages = messageService.subscribeMessages(
+      conversationId, user.id,
+      (messages) => setState((current) => ({ ...current, messages, error: null })),
+      (cause) => setState((current) => ({ ...current, error: describeFirebaseError(cause) })),
+    );
+    return () => { offConversation(); offMessages(); };
+  }, [conversationId, user.id, attempt]);
+  useEffect(() => { bottom.current?.scrollIntoView({ block: "end" }); }, [state.messages]);
+  if (!conversationId || state.conversation === null) return <div className="screen nav-screen"><Topbar go={go} back="messages" title="Conversation" /><main className="page-content"><div className="empty-state"><span><Icon name="chat" size={33} /></span><h2>Conversation not found</h2><p>It may not exist, or it belongs to another account.</p><button className="primary-button" type="button" onClick={() => go("messages")}>Back to messages</button></div></main></div>;
+  const { conversation, messages } = state;
+  if (conversation === undefined || messages === null) return <div className="screen nav-screen"><Topbar go={go} back="messages" title="Conversation" /><main className="page-content"><DataNotice info={{ status: state.error ? "error" : "loading", error: state.error, retry: () => { setState({ conversation: undefined, messages: null, error: null }); setAttempt((n) => n + 1); } }} go={go} what="this conversation" /></main></div>;
   const name = otherPartyName(conversation, user.id);
   const listing = listings.find((item) => item.id === conversation.listingId);
-  const send = (event: FormEvent) => {
+  const send = async (event: FormEvent) => {
     event.preventDefault();
-    if (!draft.trim()) return;
+    const body = draft;
+    if (!body.trim()) return;
+    setDraft("");
+    setError("");
     try {
-      const sent = messageService.send(conversation.id, user, draft);
-      setMessages((current) => [...current, sent]);
-      setDraft("");
-      setError("");
+      await messageService.send(conversation.id, user, body);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Unable to send your message.");
+      setDraft(body);
+      setError(describeFirebaseError(cause));
     }
   };
-  return <div className="screen chat-screen"><header className="chat-header"><button className="icon-button" onClick={() => go("messages")} type="button" aria-label="Back to messages"><Icon name="back" /></button><span className="seller-avatar">{initialsOf(name)}</span><div><strong>{name}</strong><small>Active now</small></div></header><div className="chat-item"><ProductArt kind={listing ? artKind(listing.category) : "tools"} image={listing?.images[0]} /><div><small>ABOUT THIS ITEM</small><strong>{listing?.title ?? conversation.listingTitle}</strong><span>{formatPrice(listing?.price ?? conversation.listingPrice)}</span></div></div><main className="bubbles">{messages.length === 0 && <span className="day-label">No messages yet. Say hi!</span>}{messages.map((message, index) => <div key={message.id} style={{ display: "contents" }}>{(index === 0 || formatDayLabel(message.createdAt) !== formatDayLabel(messages[index - 1].createdAt)) && <span className="day-label">{formatDayLabel(message.createdAt)}</span>}<div className={`bubble ${message.senderId === user.id ? "mine" : "theirs"}`}>{message.text}<small>{formatMessageTime(message.createdAt)}</small></div></div>)}{error && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11, alignSelf: "center" }}>{error}</p>}<div ref={bottom} /></main><form className="message-form" onSubmit={send}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Write a message..." aria-label="Message" maxLength={1000} /><button type="submit" aria-label="Send"><Icon name="send" size={18} /></button></form></div>;
+  return <div className="screen chat-screen"><header className="chat-header"><button className="icon-button" onClick={() => go("messages")} type="button" aria-label="Back to messages"><Icon name="back" /></button><span className="seller-avatar">{initialsOf(name)}</span><div><strong>{name}</strong><small>Active now</small></div></header><div className="chat-item"><ProductArt kind={listing ? artKind(listing.category) : "tools"} image={listing?.images[0]} /><div><small>ABOUT THIS ITEM</small><strong>{listing?.title ?? conversation.listingTitle}</strong><span>{formatPrice(listing?.price ?? conversation.listingPrice)}</span></div></div><main className="bubbles">{messages.length === 0 && <span className="day-label">No messages yet. Say hi!</span>}{messages.map((message, index) => <div key={message.id} style={{ display: "contents" }}>{(index === 0 || formatDayLabel(message.createdAt) !== formatDayLabel(messages[index - 1].createdAt)) && <span className="day-label">{formatDayLabel(message.createdAt)}</span>}<div className={`bubble ${message.senderId === user.id ? "mine" : "theirs"}`}>{message.text}<small>{formatMessageTime(message.createdAt)}</small></div></div>)}{(error || state.error) && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11, alignSelf: "center" }}>{error || state.error}</p>}<div ref={bottom} /></main><form className="message-form" onSubmit={send}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Write a message..." aria-label="Message" maxLength={1000} /><button type="submit" aria-label="Send"><Icon name="send" size={18} /></button></form></div>;
 }
 
-function ProfileScreen({ go, user, onLogout }: { go: (route: Route) => void; user: User; onLogout: () => void }) {
-  const rows: { label: string; icon: IconName; route: Route }[] = [{ label: "My listings", icon: "uniform", route: "mylistings" }, { label: "Saved items", icon: "heart", route: "saved" }, { label: "Campus", icon: "location", route: "campus" }, { label: "Account", icon: "profile", route: "account" }, { label: "Help and safety", icon: "shield", route: "help" }];
+function ProfileScreen({ go, user, onLogout, onRefreshStatus, showAdmin }: { go: (route: Route) => void; user: User; onLogout: () => void; onRefreshStatus: () => Promise<void>; showAdmin: boolean }) {
+  const [checking, setChecking] = useState(false);
+  const notice = verificationNotice(user);
+  const rows: { label: string; icon: IconName; route: Route }[] = [{ label: "My listings", icon: "uniform", route: "mylistings" }, { label: "Saved items", icon: "heart", route: "saved" }, { label: "Campus", icon: "location", route: "campus" }, { label: "Account", icon: "profile", route: "account" }, { label: "Help and safety", icon: "shield", route: "help" }, ...(showAdmin ? [{ label: "Verification requests", icon: "check" as IconName, route: "admin" as Route }] : [])];
   const initials = initialsOf(user.fullName || user.username);
-  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content profile-content"><p className="section-kicker">YOUR CAMPUSCART</p><h1>Profile.</h1><div className="profile-card"><span className="profile-avatar">{initials}</span><div><h2>{user.fullName || user.username}</h2><p><Icon name="location" size={12} /> {user.campus || "No campus selected"}</p><span><Icon name="check" size={11} /> Campus account</span></div></div><button className="primary-button list-button" onClick={() => go("create")} type="button"><Icon name="plus" /> List an item</button><div className="profile-menu">{rows.map((row) => <button key={row.label} onClick={() => go(row.route)} type="button"><span><Icon name={row.icon} size={19} /></span>{row.label}<Icon name="chevron" size={17} /></button>)}</div><button className="logout" type="button" onClick={onLogout}>Log out</button></main><BottomNav current="profile" go={go} /></div>;
+  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content profile-content"><p className="section-kicker">YOUR CAMPUSCART</p><h1>Profile.</h1><div className="profile-card"><span className="profile-avatar">{initials}</span><div><h2>{user.fullName || user.username}</h2><p><Icon name="location" size={12} /> {user.campus || "No campus selected"}</p><span><Icon name="check" size={11} /> {verificationLabel(user)}</span></div></div>{notice && <div className="safety-note"><Icon name="shield" /><p><strong>{verificationLabel(user)}</strong><br />{notice}{firebaseMode && <><br /><button className="seller-link" type="button" disabled={checking} style={{ marginTop: 8 }} onClick={() => { setChecking(true); onRefreshStatus().finally(() => setChecking(false)); }}>{checking ? "Checking..." : "Check status"}</button></>}</p></div>}<button className="primary-button list-button" onClick={() => go("create")} type="button"><Icon name="plus" /> List an item</button><div className="profile-menu">{rows.map((row) => <button key={row.label} onClick={() => go(row.route)} type="button"><span><Icon name={row.icon} size={19} /></span>{row.label}<Icon name="chevron" size={17} /></button>)}</div><button className="logout" type="button" onClick={onLogout}>Log out</button></main><BottomNav current="profile" go={go} /></div>;
 }
 
-function MyListingsScreen({ go, user, listings, saved, toggleSaved, onDelete }: { go: GoFn; user: User; listings: Listing[]; saved: string[]; toggleSaved: (id: string) => void; onDelete: (id: string) => void }) {
+function MyListingsScreen({ go, user, listings, info, saved, toggleSaved, onDelete }: { go: GoFn; user: User; listings: Listing[]; info: DataInfo; saved: string[]; toggleSaved: (id: string) => void; onDelete: (id: string) => Promise<void> }) {
   const [error, setError] = useState("");
   const mine = listingService.forSeller(listings, user.id);
-  const remove = (listing: Listing) => {
+  const remove = async (listing: Listing) => {
     if (!window.confirm(`Delete "${listing.title}"? This can't be undone.`)) return;
-    try { setError(""); onDelete(listing.id); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to delete this listing."); }
+    try { setError(""); await onDelete(listing.id); } catch (cause) { setError(describeFirebaseError(cause)); }
   };
-  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="My listings" /><main className="page-content"><p className="section-kicker">YOUR SHELF</p><h1>My <em>listings.</em></h1>{error && <p role="alert" style={{ margin: "0 0 10px", color: "#b13a3a", fontSize: 11 }}>{error}</p>}{mine.length ? <div className="listing-grid saved-grid">{mine.map((listing) => <div key={listing.id}><ListingCard listing={listing} saved={saved.includes(listing.id)} toggleSaved={toggleSaved} go={go} /><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 8 }}><button className="outline-button" type="button" style={{ minHeight: 34, fontSize: 11 }} onClick={() => go("edit", listing.id)}>Edit</button><button className="outline-button" type="button" style={{ minHeight: 34, fontSize: 11, color: "#b13a3a" }} onClick={() => remove(listing)}>Delete</button></div></div>)}</div> : <div className="empty-state"><span><Icon name="uniform" size={33} /></span><h2>No listings yet</h2><p>Items you list for sale will show up here.</p><button className="primary-button" type="button" onClick={() => go("create")}>List an item</button></div>}</main><BottomNav current="profile" go={go} /></div>;
+  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="My listings" /><main className="page-content"><p className="section-kicker">YOUR SHELF</p><h1>My <em>listings.</em></h1>{error && <p role="alert" style={{ margin: "0 0 10px", color: "#b13a3a", fontSize: 11 }}>{error}</p>}{info.status !== "ready" ? <DataNotice info={info} go={go} what="your listings" /> : mine.length ? <div className="listing-grid saved-grid">{mine.map((listing) => <div key={listing.id}><ListingCard listing={listing} saved={saved.includes(listing.id)} toggleSaved={toggleSaved} go={go} /><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 8 }}><button className="outline-button" type="button" style={{ minHeight: 34, fontSize: 11 }} onClick={() => go("edit", listing.id)}>Edit</button><button className="outline-button" type="button" style={{ minHeight: 34, fontSize: 11, color: "#b13a3a" }} onClick={() => remove(listing)}>Delete</button></div></div>)}</div> : <div className="empty-state"><span><Icon name="uniform" size={33} /></span><h2>No listings yet</h2><p>Items you list for sale will show up here.</p><button className="primary-button" type="button" onClick={() => go("create")}>List an item</button></div>}</main><BottomNav current="profile" go={go} /></div>;
 }
 
-function CampusScreen({ go, user, onSave }: { go: GoFn; user: User; onSave: (changes: ProfileChanges) => void }) {
+function CampusScreen({ go, user, onSave }: { go: GoFn; user: User; onSave: (changes: ProfileChanges) => void | Promise<void> }) {
   const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
   const options: string[] = [...CAMPUSES];
   if (user.campus && !options.includes(user.campus)) options.unshift(user.campus);
-  const submit = (event: FormEvent<HTMLFormElement>) => {
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const campus = String(new FormData(event.currentTarget).get("campus") ?? "");
     try {
-      onSave({ campus: String(new FormData(event.currentTarget).get("campus") ?? "") });
+      await onSave({ campus });
       setMessage({ text: "Campus updated.", error: false });
     } catch (cause) {
-      setMessage({ text: cause instanceof Error ? cause.message : "Unable to update your campus.", error: true });
+      setMessage({ text: firebaseMode ? describeFirebaseError(cause) : cause instanceof Error ? cause.message : "Unable to update your campus.", error: true });
     }
   };
   return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Campus" /><main className="create-content"><p className="section-kicker">YOUR CAMPUS</p><h1>Where do you <em>sell?</em></h1><form onSubmit={submit}><label>Campus<select name="campus" defaultValue={user.campus || options[0]}>{options.map((campus) => <option key={campus}>{campus}</option>)}</select></label><p className="description">New listings you post will show this campus. Listings you already posted keep the campus they were posted with.</p>{message && <p role={message.error ? "alert" : "status"} style={{ margin: 0, color: message.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{message.text}</p>}<button className="primary-button wide" type="submit">Save campus <Icon name="arrow" size={17} /></button></form></main><BottomNav current="profile" go={go} /></div>;
 }
 
-function AccountScreen({ go, user, onSave }: { go: GoFn; user: User; onSave: (changes: ProfileChanges) => void }) {
+function AccountScreen({ go, user, onSave }: { go: GoFn; user: User; onSave: (changes: ProfileChanges) => void | Promise<void> }) {
   const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
-  const submit = (event: FormEvent<HTMLFormElement>) => {
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const fields = new FormData(event.currentTarget);
     try {
-      onSave({ fullName: String(fields.get("fullName") ?? ""), username: String(fields.get("username") ?? ""), email: String(fields.get("email") ?? "") });
+      // Firebase accounts: email is tied to sign-in and can't be edited here yet.
+      await onSave({ fullName: String(fields.get("fullName") ?? ""), username: String(fields.get("username") ?? ""), ...(firebaseMode ? {} : { email: String(fields.get("email") ?? "") }) });
       setMessage({ text: "Account updated.", error: false });
     } catch (cause) {
-      setMessage({ text: cause instanceof Error ? cause.message : "Unable to update your account.", error: true });
+      setMessage({ text: firebaseMode ? describeFirebaseError(cause) : cause instanceof Error ? cause.message : "Unable to update your account.", error: true });
     }
   };
   const joined = new Date(user.createdAt);
-  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Account" /><main className="create-content"><p className="section-kicker">YOUR ACCOUNT</p><h1>Account <em>details.</em></h1><form key={`${user.fullName}|${user.username}|${user.email}`} onSubmit={submit}><label>Full Name<input required name="fullName" defaultValue={user.fullName} placeholder="Enter your full name" /></label><label>Username<input required name="username" defaultValue={user.username} placeholder="Enter your username" /></label><label>Campus Email<input required name="email" type="email" defaultValue={user.email} placeholder="name@urs.edu.ph" /></label><p className="description">{Number.isNaN(joined.getTime()) ? "Member of CampusCart" : `Member since ${joined.toLocaleDateString("en-PH", { month: "long", year: "numeric" })}`} · {user.campus || "No campus selected"}</p>{message && <p role={message.error ? "alert" : "status"} style={{ margin: 0, color: message.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{message.text}</p>}<button className="primary-button wide" type="submit">Save changes <Icon name="arrow" size={17} /></button></form><button className="outline-button wide" type="button" disabled style={{ width: "100%", marginTop: 22, opacity: 0.55 }}>Change password</button><p className="description" style={{ marginTop: 8 }}>Password changes will be available once online accounts are added. Your password is never shown here.</p></main><BottomNav current="profile" go={go} /></div>;
+  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Account" /><main className="create-content"><p className="section-kicker">YOUR ACCOUNT</p><h1>Account <em>details.</em></h1><form key={`${user.fullName}|${user.username}|${user.email}`} onSubmit={submit}><label>Full Name<input required name="fullName" defaultValue={user.fullName} placeholder="Enter your full name" /></label><label>Username<input required name="username" defaultValue={user.username} placeholder="Enter your username" /></label><label>Campus Email<input required name="email" type="email" defaultValue={user.email} readOnly={firebaseMode} placeholder="name@urs.edu.ph" /></label><p className="description">{Number.isNaN(joined.getTime()) ? "Member of CampusCart" : `Member since ${joined.toLocaleDateString("en-PH", { month: "long", year: "numeric" })}`} · {user.campus || "No campus selected"}{user.studentNumber ? ` · Student no. ${user.studentNumber}` : ""} · {verificationLabel(user)}</p>{message && <p role={message.error ? "alert" : "status"} style={{ margin: 0, color: message.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{message.text}</p>}<button className="primary-button wide" type="submit">Save changes <Icon name="arrow" size={17} /></button></form><button className="outline-button wide" type="button" disabled style={{ width: "100%", marginTop: 22, opacity: 0.55 }}>Change password</button><p className="description" style={{ marginTop: 8 }}>Password changes will be available once online accounts are added. Your password is never shown here.</p></main><BottomNav current="profile" go={go} /></div>;
 }
 
 function HelpScreen({ go }: { go: GoFn }) {
@@ -344,12 +430,55 @@ function HelpScreen({ go }: { go: GoFn }) {
   return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Help and safety" /><main className="page-content"><p className="section-kicker">WE'VE GOT YOU</p><h1>Help &amp; <em>safety.</em></h1><div className="detail-info" style={{ padding: 0 }}>{sections.map((section) => <div key={section.title}><h3>{section.title}</h3><ul className="description" style={{ margin: 0, paddingLeft: 18 }}>{section.items.map((item) => <li key={item}>{item}</li>)}</ul></div>)}<h3>Reporting a problem</h3><p className="description">CampusCart can&apos;t take reports inside the app yet, so nothing you do here is sent to anyone. If a listing or user seems unsafe, tell your campus security or student affairs office and share the listing title and seller name. In an emergency, call 911.</p><div className="safety-note"><Icon name="shield" /><p><strong>Your data stays on this device</strong><br />This prototype saves accounts, listings and messages in your browser only.</p></div></div></main><BottomNav current="profile" go={go} /></div>;
 }
 
+function RestrictedScreen({ go, user, title = "Student verification needed", message }: { go: GoFn; user: User; title?: string; message?: string }) {
+  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Verification needed" /><main className="page-content"><div className="empty-state"><span><Icon name="shield" size={33} /></span><h2>{title}</h2><p>{message ?? (verificationNotice(user) || "This action needs a verified student account.")}</p><button className="primary-button" type="button" onClick={() => go("profile")}>{message ? "Back to profile" : "View verification status"}</button></div></main><BottomNav current="profile" go={go} /></div>;
+}
+
+function AdminScreen({ go }: { go: GoFn }) {
+  const [requests, setRequests] = useState<PendingStudent[] | null>(null);
+  const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    adminService.listPending().then(
+      (list) => { if (active) setRequests(list); },
+      (cause) => { if (active) { setRequests([]); setMessage({ text: describeFirebaseError(cause), error: true }); } },
+    );
+    return () => { active = false; };
+  }, []);
+  const run = async (student: PendingStudent, action: "view" | "approve" | "reject") => {
+    if (busy) return;
+    if (action !== "view" && !window.confirm(`${action === "approve" ? "Approve" : "Reject"} ${student.fullName || student.email}?`)) return;
+    setBusy(student.id);
+    setMessage(null);
+    // Open the tab inside the click so popup blockers allow it, then point it at the short-lived link.
+    const tab = action === "view" ? window.open("", "_blank") : null;
+    try {
+      if (action === "view") {
+        const url = await adminService.getCorUrl(student.id);
+        if (tab) { tab.opener = null; tab.location.href = url; } else window.location.assign(url);
+      } else {
+        await (action === "approve" ? adminService.approve(student.id) : adminService.reject(student.id));
+        setRequests((current) => (current ?? []).filter((entry) => entry.id !== student.id));
+        setMessage({ text: action === "approve" ? "Student approved." : "Student rejected.", error: false });
+      }
+    } catch (cause) {
+      tab?.close();
+      setMessage({ text: describeFirebaseError(cause), error: true });
+    } finally {
+      setBusy(null);
+    }
+  };
+  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Verification requests" /><main className="page-content"><p className="section-kicker">STUDENT VERIFICATION</p><h1>Pending <em>requests.</em></h1>{message && <p role={message.error ? "alert" : "status"} style={{ margin: "0 0 10px", color: message.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{message.text}</p>}{requests === null ? <p className="description">Loading...</p> : requests.length === 0 ? <div className="empty-state"><span><Icon name="check" size={33} /></span><h2>No pending requests</h2><p>New student sign-ups waiting for review will appear here.</p></div> : requests.map((student) => <div key={student.id}><div className="profile-card"><span className="profile-avatar">{initialsOf(student.fullName || student.email)}</span><div><h2>{student.fullName || "Unnamed student"}</h2><p>Student no. {student.studentNumber || "-"} · {student.campus || "No campus"}</p><span>{student.email}</span></div></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, margin: "8px 0 18px" }}><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11 }} onClick={() => run(student, "view")}>View COR</button><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11 }} onClick={() => run(student, "approve")}>Approve</button><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11, color: "#b13a3a" }} onClick={() => run(student, "reject")}>Reject</button></div></div>)}</main><BottomNav current="profile" go={go} /></div>;
+}
+
 function MissingListingScreen({ go }: { go: GoFn }) {
   return <div className="screen nav-screen"><Topbar go={go} back="mylistings" title="Edit listing" /><main className="page-content"><div className="empty-state"><span><Icon name="search" size={33} /></span><h2>Listing not found</h2><p>It may have been deleted, or it isn&apos;t yours to edit.</p><button className="primary-button" type="button" onClick={() => go("mylistings")}>Back to my listings</button></div></main></div>;
 }
 
-function CreateScreen({ go, onPublish, listing }: { go: GoFn; listing?: Listing; onPublish: (input: { title: string; price: number; condition: ListingCondition; category: ListingCategory; description: string; images: string[] }) => void }) {
+function CreateScreen({ go, onPublish, listing }: { go: GoFn; listing?: Listing; onPublish: (input: { title: string; price: number; condition: ListingCondition; category: ListingCategory; description: string; images: string[] }) => Promise<void> }) {
   const [done, setDone] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [images, setImages] = useState<string[]>(listing?.images ?? []);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -365,14 +494,16 @@ function CreateScreen({ go, onPublish, listing }: { go: GoFn; listing?: Listing;
     }
     event.target.value = "";
   };
-  const submit = (event: FormEvent<HTMLFormElement>) => {
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (busy) return;
     setError("");
     const fields = new FormData(event.currentTarget);
     const price = parsePrice(String(fields.get("price") ?? ""));
     if (price === null) { setError("Please enter a valid price, e.g. 250."); return; }
     try {
-      onPublish({
+      setBusy(true);
+      await onPublish({
         title: String(fields.get("title") ?? ""),
         price,
         condition: String(fields.get("condition")) as ListingCondition,
@@ -382,32 +513,105 @@ function CreateScreen({ go, onPublish, listing }: { go: GoFn; listing?: Listing;
       });
       setDone(true);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Unable to publish your listing. Please try again.");
+      setError(describeFirebaseError(cause));
+    } finally {
+      setBusy(false);
     }
   };
   if (done && listing) return <div className="screen success-screen"><span><Icon name="check" size={36} /></span><p className="under-label">LISTING UPDATED</p><h1>Your changes are saved.</h1><p>Your listing is up to date for students nearby.</p><button className="primary-button wide" type="button" onClick={() => go("mylistings")}>Back to my listings</button></div>;
   if (done) return <div className="screen success-screen"><span><Icon name="check" size={36} /></span><p className="under-label">LISTING PUBLISHED</p><h1>Your good find is now live.</h1><p>Students nearby can now discover and message you about your item.</p><button className="primary-button wide" type="button" onClick={() => go("home")}>Back to marketplace</button></div>;
-  return <div className="screen create-screen"><Topbar go={go} back={listing ? "mylistings" : "home"} title={listing ? "Edit listing" : "List an item"} /><main className="create-content"><p className="section-kicker">{listing ? "EDIT YOUR LISTING" : "SELL ON CAMPUS"}</p><h1>{listing ? <>Update your <em>listing.</em></> : <>Pass on a <em>good thing.</em></>}</h1><form onSubmit={submit}><input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={pickPhotos} /><button className="photo-upload" type="button" onClick={() => fileInput.current?.click()}><Icon name="camera" size={28} /><strong>Add photos</strong><small>{images.length ? `${images.length} of ${MAX_IMAGES} photo${images.length > 1 ? "s" : ""} added` : `Add up to ${MAX_IMAGES} clear photos`}</small></button>{images.length > 0 && <button className="seller-link" type="button" style={{ marginTop: 0, alignSelf: "flex-start" }} onClick={() => setImages([])}>Remove all photos</button>}<label>Item title<input required name="title" defaultValue={listing?.title} placeholder="What are you selling?" /></label><div className="two-fields"><label>Price<input required name="price" inputMode="decimal" defaultValue={listing ? String(listing.price) : undefined} placeholder="₱ 0.00" /></label><label>Condition<select name="condition" defaultValue={listing?.condition ?? "Good as new"}>{LISTING_CONDITIONS.map((item) => <option key={item}>{item}</option>)}</select></label></div><label>Category<select name="category" defaultValue={listing?.category ?? "Uniforms"}>{LISTING_CATEGORIES.map((item) => <option key={item}>{item}</option>)}</select></label><label>Description<textarea required name="description" defaultValue={listing?.description} placeholder="Share useful details about your item" /></label>{error && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11 }}>{error}</p>}<button className="primary-button wide" type="submit">{listing ? "Save changes" : "Publish listing"} <Icon name="arrow" size={17} /></button></form></main></div>;
+  return <div className="screen create-screen"><Topbar go={go} back={listing ? "mylistings" : "home"} title={listing ? "Edit listing" : "List an item"} /><main className="create-content"><p className="section-kicker">{listing ? "EDIT YOUR LISTING" : "SELL ON CAMPUS"}</p><h1>{listing ? <>Update your <em>listing.</em></> : <>Pass on a <em>good thing.</em></>}</h1><form onSubmit={submit}><input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={pickPhotos} /><button className="photo-upload" type="button" onClick={() => fileInput.current?.click()}><Icon name="camera" size={28} /><strong>Add photos</strong><small>{images.length ? `${images.length} of ${MAX_IMAGES} photo${images.length > 1 ? "s" : ""} added` : `Add up to ${MAX_IMAGES} clear photos`}</small></button>{images.length > 0 && <button className="seller-link" type="button" style={{ marginTop: 0, alignSelf: "flex-start" }} onClick={() => setImages([])}>Remove all photos</button>}<label>Item title<input required name="title" defaultValue={listing?.title} placeholder="What are you selling?" /></label><div className="two-fields"><label>Price<input required name="price" inputMode="decimal" defaultValue={listing ? String(listing.price) : undefined} placeholder="₱ 0.00" /></label><label>Condition<select name="condition" defaultValue={listing?.condition ?? "Good as new"}>{LISTING_CONDITIONS.map((item) => <option key={item}>{item}</option>)}</select></label></div><label>Category<select name="category" defaultValue={listing?.category ?? "Uniforms"}>{LISTING_CATEGORIES.map((item) => <option key={item}>{item}</option>)}</select></label><label>Description<textarea required name="description" defaultValue={listing?.description} placeholder="Share useful details about your item" /></label>{error && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11 }}>{error}</p>}<button className="primary-button wide" type="submit" disabled={busy}>{listing ? "Save changes" : "Publish listing"} <Icon name="arrow" size={17} /></button></form></main></div>;
 }
 
 function App() {
-  const [user, setUser] = useState<User | null>(() => authService.getCurrentUser());
-  const [listings, setListings] = useState<Listing[]>(() => listingService.getAll());
-  const [saved, setSaved] = useState<string[]>(() => savedService.getIds(authService.getCurrentUser()?.id));
+  const [user, setUser] = useState<User | null>(() => (firebaseMode ? null : authService.getCurrentUser()));
+  const [authReady, setAuthReady] = useState(!firebaseMode);
+  // Whether to SHOW admin screens. This is a UI convenience only: the rules and Edge Functions decide what is allowed.
+  const [adminFor, setAdminFor] = useState<{ uid: string; admin: boolean } | null>(null);
+  // Listings and saved items are subscriptions (Firestore in Firebase mode). Each result is stored with the
+  // account it belongs to, so data from a previous account can never be shown after logging in or out.
+  const [listingState, setListingState] = useState<{ key: string; items: Listing[]; error: string | null } | null>(null);
+  const [savedState, setSavedState] = useState<{ key: string; ids: string[]; error: string | null } | null>(null);
+  const [dataRetry, setDataRetry] = useState(0);
   const [listingId, setListingId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("id"));
   const [conversationId, setConversationId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("c"));
-  const [route, setRoute] = useState<Route>(() => guard(pathToRoute[window.location.pathname] ?? "home", authService.getCurrentUser()));
+  const [route, setRoute] = useState<Route>(() => initialGuard(pathToRoute[window.location.pathname] ?? "home"));
   useEffect(() => {
     const onPop = () => {
-      setRoute(guard(pathToRoute[window.location.pathname] ?? "home", authService.getCurrentUser()));
+      setRoute(initialGuard(pathToRoute[window.location.pathname] ?? "home"));
       setListingId(new URLSearchParams(window.location.search).get("id"));
       setConversationId(new URLSearchParams(window.location.search).get("c"));
     };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
-  const go: GoFn = (next, id) => {
-    const destination = guard(next, user);
+  useEffect(() => {
+    if (!firebaseMode) return;
+    return firebaseAuthService.onAuthChange((account) => {
+      setUser(account);
+      setAuthReady(true);
+    });
+  }, []);
+  useEffect(() => {
+    if (!firebaseMode || !user) return;
+    let active = true;
+    adminService.isAdmin(user.id).then((admin) => {
+  console.log("CampusCart admin check:", {
+    signedInUid: user.id,
+    isAdmin: admin,
+  });
+  if (active) setAdminFor({ uid: user.id, admin });
+});
+    return () => { active = false; };
+  }, [user]);
+  const adminState: "unknown" | "yes" | "no" = !firebaseMode || !user ? "no" : adminFor?.uid === user.id ? (adminFor.admin ? "yes" : "no") : "unknown";
+  const userId = user?.id ?? null;
+  const dataKey = userId ?? "guest";
+  useEffect(() => {
+    // In Firebase mode there is no server data for guests, so nothing is subscribed (and nothing local is shown).
+    if (!authReady || (firebaseMode && !userId)) return;
+    const key = userId ?? "guest";
+    return listingService.subscribe(
+      (items) => setListingState({ key, items, error: null }),
+      (cause) => setListingState({ key, items: [], error: describeFirebaseError(cause) }),
+    );
+  }, [authReady, userId, dataRetry]);
+  useEffect(() => {
+    if (!authReady || (firebaseMode && !userId)) return;
+    const key = userId ?? "guest";
+    return savedService.subscribe(
+      userId,
+      (ids) => setSavedState({ key, ids, error: null }),
+      (cause) => setSavedState({ key, ids: [], error: describeFirebaseError(cause) }),
+    );
+  }, [authReady, userId, dataRetry]);
+  const reloadData = () => { setListingState(null); setSavedState(null); setDataRetry((n) => n + 1); };
+  const currentListings = listingState !== null && listingState.key === dataKey ? listingState : null;
+  const currentSaved = savedState !== null && savedState.key === dataKey ? savedState : null;
+  const listings = currentListings ? currentListings.items : NO_LISTINGS;
+  const saved = currentSaved ? currentSaved.ids : NO_IDS;
+  const listingsInfo: DataInfo = {
+    status: firebaseMode && !userId ? "signedOut" : !currentListings ? "loading" : currentListings.error ? "error" : "ready",
+    error: currentListings ? currentListings.error : null,
+    retry: reloadData,
+  };
+  const savedInfo: DataInfo = listingsInfo.status !== "ready" ? listingsInfo : {
+    status: !currentSaved ? "loading" : currentSaved.error ? "error" : "ready",
+    error: currentSaved ? currentSaved.error : null,
+    retry: reloadData,
+  };
+  const listingsStatus = listingsInfo.status;
+  const savedStatus = savedInfo.status;
+  useEffect(() => {
+    // A seller deleting a listing can't touch other people's saved lists, so each user removes their own
+    // dangling ids once the server confirms the listing is gone.
+    if (!firebaseMode || !userId || listingsStatus !== "ready" || savedStatus !== "ready") return;
+    const known = new Set(listings.map((item) => item.id));
+    const missing = saved.filter((id) => !known.has(id));
+    if (missing.length) void savedService.pruneMissing(userId, missing);
+  }, [listings, saved, userId, listingsStatus, savedStatus]);
+  const go: GoFn = (next, id, actingUser = user) => {
+    const destination = guard(next, actingUser);
     const query = (destination === "product" || destination === "edit") && id ? `?id=${encodeURIComponent(id)}` : destination === "chat" && id ? `?c=${encodeURIComponent(id)}` : "";
     window.history.pushState({}, "", routeToPath[destination] + query);
     if (destination === "product" || destination === "edit") setListingId(id ?? null);
@@ -415,62 +619,73 @@ function App() {
     setRoute(destination);
     window.scrollTo(0, 0);
   };
-  const onAuthenticated = (account: User) => { setUser(account); setSaved(savedService.getIds(account.id)); go("home"); };
+  const onAuthenticated = (account: User) => {
+    setUser(account);
+    // Students who are not verified yet land on Profile, where their status is shown.
+    go(canUseMarketplace(account) ? "home" : "profile", undefined, account);
+  };
   const onLogout = () => {
-    authService.logout();
+    if (firebaseMode) void firebaseAuthService.logout(); else authService.logout();
     setUser(null);
-    setSaved(savedService.getIds(null));
     window.history.replaceState({}, "", routeToPath.welcome);
     setRoute("welcome");
     window.scrollTo(0, 0);
   };
-  const toggleSaved = (id: string) => setSaved(savedService.toggle(user?.id, id));
+  const toggleSaved = (id: string) => {
+    // Firebase mode: saved items belong to an account, so guests are asked to log in instead of saving locally.
+    if (firebaseMode && !user) { go("login"); return; }
+    savedService.set(userId, id, !saved.includes(id)).catch((cause) => window.alert(describeFirebaseError(cause)));
+  };
   /** Returns an error message to show on the listing, or null when it navigated away. */
-  const messageSeller = (listing: Listing): string | null => {
+  const messageSeller = async (listing: Listing): Promise<string | null> => {
     if (!user) { go("login"); return null; }
+    if (!canUseMarketplace(user)) return verificationNotice(user);
     try {
-      go("chat", messageService.getOrCreateConversation(listing, user).id);
+      go("chat", (await messageService.getOrCreateConversation(listing, user)).id);
       return null;
     } catch (cause) {
-      return cause instanceof Error ? cause.message : "Unable to open this conversation.";
+      return describeFirebaseError(cause);
     }
   };
-  const publish: Parameters<typeof CreateScreen>[0]["onPublish"] = (input) => {
+  const publish: Parameters<typeof CreateScreen>[0]["onPublish"] = async (input) => {
     if (!user) throw new Error("Please log in to publish a listing.");
-    listingService.create(input, user);
-    setListings(listingService.getAll());
+    if (!canUseMarketplace(user)) throw new Error(verificationNotice(user));
+    await listingService.create(input, user);
   };
-  const editListing: Parameters<typeof CreateScreen>[0]["onPublish"] = (input) => {
+  const editListing: Parameters<typeof CreateScreen>[0]["onPublish"] = async (input) => {
     if (!user || !listingId) throw new Error("Please log in to edit a listing.");
-    listingService.update(listingId, input, user);
-    setListings(listingService.getAll());
+    await listingService.update(listingId, input, user);
   };
-  const deleteListing = (id: string) => {
+  const deleteListing = async (id: string) => {
     if (!user) throw new Error("Please log in to delete a listing.");
-    listingService.remove(id, user);
-    setListings(listingService.getAll());
-    setSaved(savedService.getIds(user.id));
+    await listingService.remove(id, user);
   };
-  const saveProfile = (changes: ProfileChanges) => {
-    if (!user) throw new Error("Please log in to update your profile.");
-    const updated = authService.updateProfile(user.id, changes);
+  const applyProfile = (updated: User, changes: ProfileChanges) => {
     setUser(updated);
     if (changes.fullName !== undefined) {
-      listingService.syncSellerName(updated);
-      messageService.syncUserName(updated);
-      setListings(listingService.getAll());
+      // Best effort: the profile is already saved, and names re-sync the next time they are edited.
+      listingService.syncSellerName(updated).catch(() => undefined);
+      messageService.syncUserName(updated).catch(() => undefined);
     }
   };
+  const saveProfile = (changes: ProfileChanges): void | Promise<void> => {
+    if (!user) throw new Error("Please log in to update your profile.");
+    if (firebaseMode) return firebaseAuthService.updateProfile(user, changes).then((updated) => applyProfile(updated, changes));
+    applyProfile(authService.updateProfile(user.id, changes), changes);
+  };
+  const refreshStatus = async () => { await firebaseAuthService.refreshCurrentUser().catch(() => undefined); };
   const loginScreen = <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />;
   const editing = user ? listings.find((item) => item.id === listingId && item.sellerId === user.id) : undefined;
   const screens: Record<Route, ReactNode> = {
-    mylistings: user ? <MyListingsScreen go={go} user={user} listings={listings} saved={saved} toggleSaved={toggleSaved} onDelete={deleteListing} /> : loginScreen,
-    edit: !user ? loginScreen : editing ? <CreateScreen key={editing.id} go={go} listing={editing} onPublish={editListing} /> : <MissingListingScreen go={go} />,
+    admin: !user ? loginScreen : adminState === "unknown" ? <div className="screen"><main className="page-content"><p className="section-kicker">LOADING...</p></main></div> : adminState === "yes" ? <AdminScreen go={go} /> : <RestrictedScreen go={go} user={user} title="Administrators only" message="This area is only available to the CampusCart administrator." />,
+    mylistings: user ? <MyListingsScreen go={go} user={user} listings={listings} info={listingsInfo} saved={saved} toggleSaved={toggleSaved} onDelete={deleteListing} /> : loginScreen,
+    edit: !user ? loginScreen : !canUseMarketplace(user) ? <RestrictedScreen go={go} user={user} /> : editing ? <CreateScreen key={editing.id} go={go} listing={editing} onPublish={editListing} /> : listingsInfo.status !== "ready" ? <div className="screen nav-screen"><Topbar go={go} back="mylistings" title="Edit listing" /><main className="page-content"><DataNotice info={listingsInfo} go={go} what="this listing" /></main></div> : <MissingListingScreen go={go} />,
     campus: user ? <CampusScreen go={go} user={user} onSave={saveProfile} /> : loginScreen,
     account: user ? <AccountScreen go={go} user={user} onSave={saveProfile} /> : loginScreen,
     help: user ? <HelpScreen go={go} /> : loginScreen,
-    welcome: <WelcomeScreen go={go} />, home: <HomeScreen go={go} listings={listings} saved={saved} toggleSaved={toggleSaved} />, login: <AuthScreen key="login" mode="login" go={go} onAuthenticated={onAuthenticated} />, signup: <AuthScreen key="signup" mode="signup" go={go} onAuthenticated={onAuthenticated} />, product: <ProductScreen key={listingId ?? "none"} go={go} item={listings.find((item) => item.id === listingId)} saved={saved} toggleSaved={toggleSaved} onMessageSeller={messageSeller} />, saved: <SavedScreen go={go} listings={listings} saved={saved} toggleSaved={toggleSaved} />, messages: user ? <MessagesScreen go={go} user={user} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, chat: user ? <ChatScreen key={conversationId ?? "none"} go={go} user={user} conversationId={conversationId} listings={listings} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, profile: user ? <ProfileScreen go={go} user={user} onLogout={onLogout} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, create: user ? <CreateScreen go={go} onPublish={publish} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />,
+    welcome: <WelcomeScreen go={go} />, home: <HomeScreen go={go} listings={listings} info={listingsInfo} saved={saved} toggleSaved={toggleSaved} />, login: <AuthScreen key="login" mode="login" go={go} onAuthenticated={onAuthenticated} />, signup: <AuthScreen key="signup" mode="signup" go={go} onAuthenticated={onAuthenticated} />, product: <ProductScreen key={listingId ?? "none"} go={go} item={listings.find((item) => item.id === listingId)} info={listingsInfo} saved={saved} toggleSaved={toggleSaved} onMessageSeller={messageSeller} />, saved: <SavedScreen go={go} listings={listings} info={savedInfo} saved={saved} toggleSaved={toggleSaved} />, messages: user ? (canUseMarketplace(user) ? <MessagesScreen go={go} user={user} /> : <RestrictedScreen go={go} user={user} />) : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, chat: user ? (!canUseMarketplace(user) ? <RestrictedScreen go={go} user={user} /> : <ChatScreen key={conversationId ?? "none"} go={go} user={user} conversationId={conversationId} listings={listings} />) : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, profile: user ? <ProfileScreen go={go} user={user} onLogout={onLogout} onRefreshStatus={refreshStatus} showAdmin={adminState === "yes"} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, create: user ? (canUseMarketplace(user) ? <CreateScreen go={go} onPublish={publish} /> : <RestrictedScreen go={go} user={user} />) : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />,
   };
+  if (!authReady) return <div className="app-shell"><div className="screen"><main className="page-content"><p className="section-kicker">LOADING...</p></main></div></div>;
   return <div className="app-shell">{screens[route]}</div>;
 }
 
