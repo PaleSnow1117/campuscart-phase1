@@ -20,7 +20,9 @@ export class UpstreamError extends Error {
 export function errorResponse(fn: string, error: unknown, cors: CorsHeaders): Response {
   if (error instanceof HttpError) return json({ error: error.message }, error.status, cors);
   // Log the kind of failure only. Never log tokens, URLs or file contents.
-  console.error(`${fn} failed:`, error instanceof Error ? error.name : "unknown");
+  // UpstreamError messages are fixed strings (e.g. "Firestore write failed (403)"): safe to log, and they make a
+  // misconfigured rule or attestor easy to diagnose. Nothing from the request, token or file is ever logged.
+  console.error(`${fn} failed:`, error instanceof UpstreamError ? error.message : error instanceof Error ? error.name : "unknown");
   if (error instanceof UpstreamError) return json({ error: "Something went wrong on our side. Please try again." }, 503, cors);
   return json({ error: "Something went wrong. Please try again." }, 500, cors);
 }

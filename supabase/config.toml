@@ -13,3 +13,6 @@ verify_jwt = false
 
 [functions.verify-cor]
 verify_jwt = false
+
+[functions.profile-picture]
+verify_jwt = false

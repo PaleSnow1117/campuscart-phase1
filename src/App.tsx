@@ -1,15 +1,20 @@
-import { type ChangeEvent, type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
+import { type ChangeEvent, type FormEvent, type ReactNode, createContext, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { AvatarFace } from "./Avatar";
+import { AVATAR_ACCEPT, AVATAR_INPUT_MAX_LABEL, prepareAvatar } from "./data/avatarService";
 import { authService } from "./data/authService";
 import { COR_ACCEPT, COR_MAX_LABEL, validateCorFile } from "./data/corService";
 import { isFirebaseConfigured } from "./data/firebase";
 import { describeFirebaseError } from "./data/firebaseErrors";
 import { firebaseAuthService } from "./data/firebaseAuthService";
-import { adminService, type PendingStudent } from "./data/adminService";
+import { adminService, type PendingStudent, type StudentNumberReview } from "./data/adminService";
+import { studentNumberService, type StudentNumberRequest } from "./data/studentNumberService";
+import { installAndroidBackButton } from "./data/androidBack";
+import { decideBack, readHistoryMark, registerBackInterceptor, runBackInterceptors } from "./data/navigation";
 import { imageService, MAX_IMAGES } from "./data/imageService";
 import { artKind, formatPostedAt, formatPrice, listingService, parsePrice, savedService } from "./data/listingService";
-import { formatConversationTime, formatDayLabel, formatMessageTime, initialsOf, messageService, otherPartyName } from "./data/messageService";
+import { formatConversationTime, formatDayLabel, formatMessageTime, formatUnreadBadge, initialsOf, messageService, otherPartyId, otherPartyName, summarizeUnread, type UnreadSummary } from "./data/messageService";
 import { canUseMarketplace, verificationLabel, verificationNotice } from "./data/verification";
-import { CAMPUSES, LISTING_CATEGORIES, LISTING_CONDITIONS, type Listing, type ListingCategory, type ListingCondition, type Conversation, type Message, type ProfileChanges, type User } from "./data/types";
+import { CAMPUSES, LISTING_CATEGORIES, LISTING_CONDITIONS, type Listing, type ListingCategory, type ListingCondition, type Conversation, type Message, type ProfileChanges, type UnreadEntry, type User } from "./data/types";
 
 type Route =
   | "welcome"
@@ -84,12 +89,27 @@ const firebaseMode = isFirebaseConfigured;
 const NO_LISTINGS: Listing[] = [];
 const NO_IDS: string[] = [];
 
+// Shared by the shell so screens don't need new props: the signed-in user (top-bar avatar) and the unread messages
+// (badge on the Messages button, per-conversation badges, marking a chat as read).
+const NO_UNREAD: UnreadSummary = { total: 0, idsByConversation: new Map() };
+const UserContext = createContext<User | null>(null);
+const UnreadContext = createContext<UnreadSummary>(NO_UNREAD);
+
+const subscribeVisibility = (notify: () => void) => {
+  document.addEventListener("visibilitychange", notify);
+  return () => document.removeEventListener("visibilitychange", notify);
+};
+/** False while the app is in the background (or the tab is hidden), so messages aren't marked read while nobody can see them. */
+const usePageVisible = () => useSyncExternalStore(subscribeVisibility, () => document.visibilityState !== "hidden", () => true);
+
 /** Where a server-backed list is: still loading, ready, failed, or (Firebase mode) nobody is signed in. */
 type DataStatus = "loading" | "ready" | "error" | "signedOut";
 type DataInfo = { status: DataStatus; error: string | null; retry: () => void };
 
 // Screens that need a signed-in user (profile as in Phase 1; create needs a seller ID; messages belong to an account).
 const protectedRoutes: Route[] = ["profile", "create", "messages", "chat", "mylistings", "edit", "campus", "account", "help", "admin"];
+const knownRoutes = new Set<string>(Object.values(pathToRoute));
+const isRoute = (value: string): value is Route => knownRoutes.has(value);
 const guard = (route: Route, user: User | null): Route => (protectedRoutes.includes(route) && !user ? "login" : route);
 // In Firebase mode the signed-in user is only known after Firebase reports it, so guarding happens
 // at render time instead (protected screens show login when there is no user).
@@ -131,11 +151,19 @@ function Logo({ onClick }: { onClick?: () => void }) {
   );
 }
 
+/** The back arrow: if the previous screen is the one we want, really go back (so history doesn't pile up). */
+function backTo(go: GoFn, target: Route): void {
+  const mark = readHistoryMark(window.history.state);
+  if (mark.idx > 0 && mark.from === target) window.history.back();
+  else go(target);
+}
+
 function Topbar({ go, back, title }: { go: GoFn; back?: Route; title?: string }) {
+  const me = useContext(UserContext);
   if (back) {
-    return <header className="sub-header"><button className="icon-button" onClick={() => go(back)} type="button" aria-label="Back"><Icon name="back" /></button><h1>{title}</h1><span className="header-spacer" /></header>;
+    return <header className="sub-header"><button className="icon-button" onClick={() => backTo(go, back)} type="button" aria-label="Back"><Icon name="back" /></button><h1>{title}</h1><span className="header-spacer" /></header>;
   }
-  return <header className="topbar"><Logo onClick={() => go("home")} /><button className="avatar-mini" type="button" onClick={() => go("profile")} aria-label="Open profile">B</button></header>;
+  return <header className="topbar"><Logo onClick={() => go("home")} /><button className="avatar-mini" type="button" onClick={() => go("profile")} aria-label="Open profile"><AvatarFace userId={me?.id} version={me?.photoUpdatedAt} skip={!me?.photoPath} fallback={me ? initialsOf(me.fullName || me.username) : <Icon name="profile" size={16} />} /></button></header>;
 }
 
 const navItems: { route: Route; label: string; icon: IconName }[] = [
@@ -146,9 +174,14 @@ const navItems: { route: Route; label: string; icon: IconName }[] = [
 ];
 
 function BottomNav({ current, go }: { current: Route; go: (route: Route) => void }) {
+  const { total } = useContext(UnreadContext);
+  const badge = formatUnreadBadge(total);
   return (
     <nav className="bottom-nav" aria-label="Main navigation">
-      {navItems.map((item) => <button key={item.route} className={current === item.route ? "active" : ""} type="button" onClick={() => go(item.route)}><Icon name={item.icon} size={21} /><span>{item.label}</span></button>)}
+      {navItems.map((item) => {
+        const unread = item.route === "messages" ? badge : "";
+        return <button key={item.route} className={current === item.route ? "active" : ""} type="button" aria-label={unread ? `Messages, ${total > 99 ? "more than 99" : total} unread` : undefined} onClick={() => go(item.route)}><span className="nav-icon"><Icon name={item.icon} size={21} />{unread && <b className="nav-badge" aria-hidden="true">{unread}</b>}</span><span>{item.label}</span></button>;
+      })}
     </nav>
   );
 }
@@ -302,7 +335,7 @@ function ProductScreen({ go, item, info, saved, toggleSaved, onMessageSeller }: 
   const isSaved = saved.includes(item.id);
   const photos = item.images.length;
   const initials = item.sellerName.split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("");
-  return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main><div className="detail-art" onClick={() => photos > 1 && setPhoto((photo + 1) % photos)}><ProductArt kind={artKind(item.category)} image={item.images[photo % Math.max(photos, 1)]} large /><button className={`save-button detail-save ${isSaved ? "is-saved" : ""}`} type="button" onClick={(event) => { event.stopPropagation(); toggleSaved(item.id); }}><Icon name="heart" /></button><span className="photo-count">{(photo % Math.max(photos, 1)) + 1} / {Math.max(photos, 1)}</span></div><div className="detail-info"><div className="condition-row"><span>{item.condition}</span><small>{formatPostedAt(item.createdAt)}</small></div><h2>{item.title}</h2><strong className="detail-price">{formatPrice(item.price)}</strong><div className="seller-box"><span className="seller-avatar">{initials}</span><div><small>SELLER</small><strong>{item.sellerName}</strong><p><Icon name="location" size={12} /> {item.campus} Campus</p></div><Icon name="chevron" /></div><h3>About this item</h3><p className="description">{item.description}</p>{notice && <p role="alert" style={{ margin: "0 0 10px", color: "#b13a3a", fontSize: 11 }}>{notice}</p>}<div className="safety-note"><Icon name="shield" /><p><strong>Buy safely on campus</strong><br />Meet in a public campus area and inspect the item before paying.</p></div></div></main><div className="detail-actions"><button className="outline-button" type="button" onClick={() => toggleSaved(item.id)}><Icon name="heart" size={18} /> Save</button><button className="primary-button" type="button" disabled={opening} onClick={() => { setOpening(true); onMessageSeller(item).then((message) => setNotice(message ?? "")).finally(() => setOpening(false)); }}><Icon name="chat" size={18} /> Message seller</button></div></div>;
+  return <div className="screen detail-screen"><Topbar go={go} back="home" title="Item details" /><main><div className="detail-art" onClick={() => photos > 1 && setPhoto((photo + 1) % photos)}><ProductArt kind={artKind(item.category)} image={item.images[photo % Math.max(photos, 1)]} large /><button className={`save-button detail-save ${isSaved ? "is-saved" : ""}`} type="button" onClick={(event) => { event.stopPropagation(); toggleSaved(item.id); }}><Icon name="heart" /></button><span className="photo-count">{(photo % Math.max(photos, 1)) + 1} / {Math.max(photos, 1)}</span></div><div className="detail-info"><div className="condition-row"><span>{item.condition}</span><small>{formatPostedAt(item.createdAt)}</small></div><h2>{item.title}</h2><strong className="detail-price">{formatPrice(item.price)}</strong><div className="seller-box"><span className="seller-avatar"><AvatarFace userId={item.sellerId} fallback={initials} /></span><div><small>SELLER</small><strong>{item.sellerName}</strong><p><Icon name="location" size={12} /> {item.campus} Campus</p></div><Icon name="chevron" /></div><h3>About this item</h3><p className="description">{item.description}</p>{notice && <p role="alert" style={{ margin: "0 0 10px", color: "#b13a3a", fontSize: 11 }}>{notice}</p>}<div className="safety-note"><Icon name="shield" /><p><strong>Buy safely on campus</strong><br />Meet in a public campus area and inspect the item before paying.</p></div></div></main><div className="detail-actions"><button className="outline-button" type="button" onClick={() => toggleSaved(item.id)}><Icon name="heart" size={18} /> Save</button><button className="primary-button" type="button" disabled={opening} onClick={() => { setOpening(true); onMessageSeller(item).then((message) => setNotice(message ?? "")).finally(() => setOpening(false)); }}><Icon name="chat" size={18} /> Message seller</button></div></div>;
 }
 
 function SavedScreen({ go, listings, info, saved, toggleSaved }: { go: GoFn; listings: Listing[]; info: DataInfo; saved: string[]; toggleSaved: (id: string) => void }) {
@@ -314,6 +347,7 @@ function MessagesScreen({ go, user }: { go: GoFn; user: User }) {
   const [state, setState] = useState<{ items: Conversation[] | null; error: string | null }>({ items: null, error: null });
   const [attempt, setAttempt] = useState(0);
   const [search, setSearch] = useState("");
+  const unread = useContext(UnreadContext);
   useEffect(() => messageService.subscribeConversations(
     user.id,
     (items) => setState({ items, error: null }),
@@ -322,7 +356,7 @@ function MessagesScreen({ go, user }: { go: GoFn; user: User }) {
   const conversations = state.items ?? [];
   const text = search.toLowerCase().trim();
   const visible = conversations.filter((conversation) => !text || [otherPartyName(conversation, user.id), conversation.listingTitle, conversation.lastMessage].some((field) => field.toLowerCase().includes(text)));
-  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content"><p className="section-kicker">CAMPUS CONVERSATIONS</p><h1>Your <em>messages.</em></h1><label className="search-box message-search"><Icon name="search" size={17} /><input aria-label="Search messages" placeholder="Search messages" value={search} onChange={(event) => setSearch(event.target.value)} /></label>{state.error ? <DataNotice info={{ status: "error", error: state.error, retry: () => { setState({ items: null, error: null }); setAttempt((n) => n + 1); } }} go={go} what="messages" /> : state.items === null ? <p className="description">Loading messages...</p> : conversations.length === 0 ? <div className="empty-state"><span><Icon name="chat" size={33} /></span><h2>No messages yet</h2><p>Open a listing and tap Message seller to start a conversation.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div> : visible.length === 0 ? <div className="empty-state"><h2>No matches</h2><p>Try a different name, item or word.</p></div> : visible.map((conversation, index) => { const name = otherPartyName(conversation, user.id); return <button key={conversation.id} className="conversation" type="button" onClick={() => go("chat", conversation.id)}><span className={`seller-avatar ${index % 2 ? "gold" : ""}`}>{initialsOf(name)}</span><span className="conversation-copy"><strong>{name}</strong><small>{conversation.listingTitle}</small><p>{conversation.lastMessage || "No messages yet. Say hi!"}</p></span><span className="conversation-meta"><small>{formatConversationTime(conversation.updatedAt)}</small></span></button>; })}</main><BottomNav current="messages" go={go} /></div>;
+  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content"><p className="section-kicker">CAMPUS CONVERSATIONS</p><h1>Your <em>messages.</em></h1><label className="search-box message-search"><Icon name="search" size={17} /><input aria-label="Search messages" placeholder="Search messages" value={search} onChange={(event) => setSearch(event.target.value)} /></label>{state.error ? <DataNotice info={{ status: "error", error: state.error, retry: () => { setState({ items: null, error: null }); setAttempt((n) => n + 1); } }} go={go} what="messages" /> : state.items === null ? <p className="description">Loading messages...</p> : conversations.length === 0 ? <div className="empty-state"><span><Icon name="chat" size={33} /></span><h2>No messages yet</h2><p>Open a listing and tap Message seller to start a conversation.</p><button className="primary-button" type="button" onClick={() => go("home")}>Browse listings</button></div> : visible.length === 0 ? <div className="empty-state"><h2>No matches</h2><p>Try a different name, item or word.</p></div> : visible.map((conversation, index) => { const name = otherPartyName(conversation, user.id); const unreadCount = unread.idsByConversation.get(conversation.id)?.length ?? 0; return <button key={conversation.id} className={`conversation ${unreadCount ? "unread" : ""}`} type="button" onClick={() => go("chat", conversation.id)}><span className={`seller-avatar ${index % 2 ? "gold" : ""}`}><AvatarFace userId={otherPartyId(conversation, user.id)} fallback={initialsOf(name)} /></span><span className="conversation-copy"><strong>{name}</strong><small>{conversation.listingTitle}</small><p>{conversation.lastMessage || "No messages yet. Say hi!"}</p></span><span className="conversation-meta"><small>{formatConversationTime(conversation.updatedAt)}</small>{unreadCount > 0 && <b className="unread-count" role="status" aria-label={`${unreadCount} unread`}>{formatUnreadBadge(unreadCount)}</b>}</span></button>; })}</main><BottomNav current="messages" go={go} /></div>;
 }
 
 function ChatScreen({ go, user, conversationId, listings }: { go: GoFn; user: User; conversationId: string | null; listings: Listing[] }) {
@@ -330,7 +364,29 @@ function ChatScreen({ go, user, conversationId, listings }: { go: GoFn; user: Us
   const [attempt, setAttempt] = useState(0);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [editing, setEditing] = useState<{ id: string; previousDraft: string } | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
+  const unread = useContext(UnreadContext);
+  const visible = usePageVisible();
+  const marking = useRef<Set<string>>(new Set());
+  const pendingUnread = conversationId ? unread.idsByConversation.get(conversationId) : undefined;
+  const loaded = state.conversation != null && state.messages !== null;
+  useEffect(() => {
+    // Opening a conversation marks its unread messages as read: here, and on every other device, their markers go away.
+    // Only while the conversation is actually on screen, and only once (ids already being marked are skipped); a failed
+    // attempt is forgotten so the next change retries it. New messages arriving while the chat is open are marked the same way.
+    if (!loaded || !visible || !pendingUnread || pendingUnread.length === 0) return;
+    const fresh = pendingUnread.filter((id) => !marking.current.has(id));
+    if (fresh.length === 0) return;
+    fresh.forEach((id) => marking.current.add(id));
+    messageService.markRead(user.id, fresh).catch(() => { fresh.forEach((id) => marking.current.delete(id)); });
+  }, [loaded, visible, pendingUnread, user.id]);
+  useEffect(() => {
+    // Android Back while editing cancels the edit instead of leaving the chat.
+    if (!editing) return;
+    return registerBackInterceptor(() => { setDraft(editing.previousDraft); setEditing(null); setError(""); return true; });
+  }, [editing]);
   useEffect(() => {
     if (!conversationId) return;
     const offConversation = messageService.subscribeConversation(
@@ -351,28 +407,71 @@ function ChatScreen({ go, user, conversationId, listings }: { go: GoFn; user: Us
   if (conversation === undefined || messages === null) return <div className="screen nav-screen"><Topbar go={go} back="messages" title="Conversation" /><main className="page-content"><DataNotice info={{ status: state.error ? "error" : "loading", error: state.error, retry: () => { setState({ conversation: undefined, messages: null, error: null }); setAttempt((n) => n + 1); } }} go={go} what="this conversation" /></main></div>;
   const name = otherPartyName(conversation, user.id);
   const listing = listings.find((item) => item.id === conversation.listingId);
+  const startEdit = (message: Message) => { setEditing({ id: message.id, previousDraft: draft }); setDraft(message.text); setSelectedId(null); setError(""); };
+  const cancelEdit = () => { if (editing) setDraft(editing.previousDraft); setEditing(null); setError(""); };
+  const removeMessage = async (message: Message) => {
+    if (!window.confirm("Delete this message? This can't be undone.")) return;
+    setError("");
+    setSelectedId(null);
+    try { await messageService.remove(conversation.id, message.id, user); } catch (cause) { setError(describeFirebaseError(cause)); }
+  };
   const send = async (event: FormEvent) => {
     event.preventDefault();
     const body = draft;
+    if (editing) {
+      if (!body.trim()) { setError("Please write a message first."); return; }
+      setError("");
+      try {
+        await messageService.edit(conversation.id, editing.id, user, body);
+        setDraft(editing.previousDraft);
+        setEditing(null);
+      } catch (cause) {
+        setError(describeFirebaseError(cause));
+      }
+      return;
+    }
     if (!body.trim()) return;
     setDraft("");
     setError("");
     try {
-      await messageService.send(conversation.id, user, body);
+      await messageService.send(conversation.id, user, body, otherPartyId(conversation, user.id));
     } catch (cause) {
       setDraft(body);
       setError(describeFirebaseError(cause));
     }
   };
-  return <div className="screen chat-screen"><header className="chat-header"><button className="icon-button" onClick={() => go("messages")} type="button" aria-label="Back to messages"><Icon name="back" /></button><span className="seller-avatar">{initialsOf(name)}</span><div><strong>{name}</strong><small>Active now</small></div></header><div className="chat-item"><ProductArt kind={listing ? artKind(listing.category) : "tools"} image={listing?.images[0]} /><div><small>ABOUT THIS ITEM</small><strong>{listing?.title ?? conversation.listingTitle}</strong><span>{formatPrice(listing?.price ?? conversation.listingPrice)}</span></div></div><main className="bubbles">{messages.length === 0 && <span className="day-label">No messages yet. Say hi!</span>}{messages.map((message, index) => <div key={message.id} style={{ display: "contents" }}>{(index === 0 || formatDayLabel(message.createdAt) !== formatDayLabel(messages[index - 1].createdAt)) && <span className="day-label">{formatDayLabel(message.createdAt)}</span>}<div className={`bubble ${message.senderId === user.id ? "mine" : "theirs"}`}>{message.text}<small>{formatMessageTime(message.createdAt)}</small></div></div>)}{(error || state.error) && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11, alignSelf: "center" }}>{error || state.error}</p>}<div ref={bottom} /></main><form className="message-form" onSubmit={send}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Write a message..." aria-label="Message" maxLength={1000} /><button type="submit" aria-label="Send"><Icon name="send" size={18} /></button></form></div>;
+  return <div className="screen chat-screen"><header className="chat-header"><button className="icon-button" onClick={() => backTo(go, "messages")} type="button" aria-label="Back to messages"><Icon name="back" /></button><span className="seller-avatar"><AvatarFace userId={otherPartyId(conversation, user.id)} fallback={initialsOf(name)} /></span><div><strong>{name}</strong><small>Active now</small></div></header><div className="chat-item"><ProductArt kind={listing ? artKind(listing.category) : "tools"} image={listing?.images[0]} /><div><small>ABOUT THIS ITEM</small><strong>{listing?.title ?? conversation.listingTitle}</strong><span>{formatPrice(listing?.price ?? conversation.listingPrice)}</span></div></div><main className="bubbles">{messages.length === 0 && <span className="day-label">No messages yet. Say hi!</span>}{messages.map((message, index) => <div key={message.id} style={{ display: "contents" }}>{(index === 0 || formatDayLabel(message.createdAt) !== formatDayLabel(messages[index - 1].createdAt)) && <span className="day-label">{formatDayLabel(message.createdAt)}</span>}<div className={`bubble ${message.senderId === user.id ? "mine" : "theirs"}`} {...(message.senderId === user.id && !editing ? { role: "button", tabIndex: 0, style: { cursor: "pointer" }, onClick: () => setSelectedId(selectedId === message.id ? null : message.id), onKeyDown: (event: { key: string }) => { if (event.key === "Enter") setSelectedId(selectedId === message.id ? null : message.id); } } : {})}>{message.text}<small>{formatMessageTime(message.createdAt)}{message.editedAt ? " · edited" : ""}</small></div>{message.senderId === user.id && selectedId === message.id && !editing && <div style={{ alignSelf: "flex-end", display: "flex", gap: 14, marginTop: -6 }}><button className="seller-link" type="button" style={{ margin: 0 }} onClick={() => startEdit(message)}>Edit</button><button className="seller-link" type="button" style={{ margin: 0, color: "#b13a3a" }} onClick={() => removeMessage(message)}>Delete</button></div>}</div>)}{(error || state.error) && <p role="alert" style={{ margin: 0, color: "#b13a3a", fontSize: 11, alignSelf: "center" }}>{error || state.error}</p>}<div ref={bottom} /></main>{editing && <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 18px", borderTop: "1px solid var(--line)", background: "white", fontSize: 10, fontWeight: 700 }}><span>Editing message</span><button className="seller-link" type="button" style={{ margin: 0 }} onClick={cancelEdit}>Cancel</button></div>}<form className="message-form" onSubmit={send}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={editing ? "Edit your message..." : "Write a message..."} aria-label="Message" maxLength={1000} /><button type="submit" aria-label={editing ? "Save" : "Send"}><Icon name={editing ? "check" : "send"} size={18} /></button></form></div>;
 }
 
-function ProfileScreen({ go, user, onLogout, onRefreshStatus, showAdmin }: { go: (route: Route) => void; user: User; onLogout: () => void; onRefreshStatus: () => Promise<void>; showAdmin: boolean }) {
+function ProfileScreen({ go, user, onLogout, onRefreshStatus, onResubmitCor, showAdmin }: { go: (route: Route) => void; user: User; onLogout: () => void; onRefreshStatus: () => Promise<void>; onResubmitCor: (file: File | null) => Promise<User>; showAdmin: boolean }) {
   const [checking, setChecking] = useState(false);
+  const [resubmitting, setResubmitting] = useState(false);
+  const [resubmitNote, setResubmitNote] = useState<{ text: string; error: boolean } | null>(null);
+  // A rejected student sends a corrected COR; the server stores it and reopens the request as "pending".
+  const resubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (resubmitting) return;
+    const form = event.currentTarget;
+    const picked = new FormData(form).get("cor");
+    const file = picked instanceof File && picked.name ? picked : null;
+    const problem = validateCorFile(file);
+    if (problem) { setResubmitNote({ text: problem, error: true }); return; }
+    setResubmitting(true);
+    setResubmitNote(null);
+    try {
+      const updated = await onResubmitCor(file);
+      form.reset();
+      setResubmitNote({ text: updated.verificationStatus === "pending" ? "Corrected COR submitted. Your account is now pending review." : "Corrected COR submitted. Tap Check status to see the update.", error: false });
+    } catch (cause) {
+      setResubmitNote({ text: describeFirebaseError(cause), error: true });
+    } finally {
+      setResubmitting(false);
+    }
+  };
   const notice = verificationNotice(user);
   const rows: { label: string; icon: IconName; route: Route }[] = [{ label: "My listings", icon: "uniform", route: "mylistings" }, { label: "Saved items", icon: "heart", route: "saved" }, { label: "Campus", icon: "location", route: "campus" }, { label: "Account", icon: "profile", route: "account" }, { label: "Help and safety", icon: "shield", route: "help" }, ...(showAdmin ? [{ label: "Verification requests", icon: "check" as IconName, route: "admin" as Route }] : [])];
   const initials = initialsOf(user.fullName || user.username);
-  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content profile-content"><p className="section-kicker">YOUR CAMPUSCART</p><h1>Profile.</h1><div className="profile-card"><span className="profile-avatar">{initials}</span><div><h2>{user.fullName || user.username}</h2><p><Icon name="location" size={12} /> {user.campus || "No campus selected"}</p><span><Icon name="check" size={11} /> {verificationLabel(user)}</span></div></div>{notice && <div className="safety-note"><Icon name="shield" /><p><strong>{verificationLabel(user)}</strong><br />{notice}{firebaseMode && <><br /><button className="seller-link" type="button" disabled={checking} style={{ marginTop: 8 }} onClick={() => { setChecking(true); onRefreshStatus().finally(() => setChecking(false)); }}>{checking ? "Checking..." : "Check status"}</button></>}</p></div>}<button className="primary-button list-button" onClick={() => go("create")} type="button"><Icon name="plus" /> List an item</button><div className="profile-menu">{rows.map((row) => <button key={row.label} onClick={() => go(row.route)} type="button"><span><Icon name={row.icon} size={19} /></span>{row.label}<Icon name="chevron" size={17} /></button>)}</div><button className="logout" type="button" onClick={onLogout}>Log out</button></main><BottomNav current="profile" go={go} /></div>;
+  return <div className="screen nav-screen"><Topbar go={go} /><main className="page-content profile-content"><p className="section-kicker">YOUR CAMPUSCART</p><h1>Profile.</h1><div className="profile-card"><span className="profile-avatar"><AvatarFace userId={user.id} version={user.photoUpdatedAt} skip={!user.photoPath} fallback={initials} /></span><div><h2>{user.fullName || user.username}</h2><p><Icon name="location" size={12} /> {user.campus || "No campus selected"}</p><span><Icon name="check" size={11} /> {verificationLabel(user)}</span></div></div>{notice && <div className="safety-note"><Icon name="shield" /><p><strong>{verificationLabel(user)}</strong><br />{notice}{firebaseMode && <><br /><button className="seller-link" type="button" disabled={checking} style={{ marginTop: 8 }} onClick={() => { setChecking(true); onRefreshStatus().finally(() => setChecking(false)); }}>{checking ? "Checking..." : "Check status"}</button></>}</p></div>}{firebaseMode && user.verificationStatus === "rejected" && <form onSubmit={resubmit} style={{ display: "grid", gap: 8, margin: "0 0 13px" }}><label style={{ fontSize: 11, fontWeight: 700 }}>Corrected Certificate of Registration (COR)<input required name="cor" type="file" accept={COR_ACCEPT} style={{ display: "block", marginTop: 6, width: "100%", fontSize: 11 }} /></label><small style={{ fontWeight: 500, color: "#6e788b", fontSize: 10 }}>PDF, JPG or PNG, up to {COR_MAX_LABEL}. Your account stays restricted until an administrator approves it.</small><button className="primary-button" type="submit" disabled={resubmitting}>{resubmitting ? "Submitting..." : "Submit corrected COR"}</button></form>}{resubmitNote && <p role={resubmitNote.error ? "alert" : "status"} style={{ margin: "0 0 13px", color: resubmitNote.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{resubmitNote.text}</p>}<button className="primary-button list-button" onClick={() => go("create")} type="button"><Icon name="plus" /> List an item</button><div className="profile-menu">{rows.map((row) => <button key={row.label} onClick={() => go(row.route)} type="button"><span><Icon name={row.icon} size={19} /></span>{row.label}<Icon name="chevron" size={17} /></button>)}</div><button className="logout" type="button" onClick={onLogout}>Log out</button></main><BottomNav current="profile" go={go} /></div>;
 }
 
 function MyListingsScreen({ go, user, listings, info, saved, toggleSaved, onDelete }: { go: GoFn; user: User; listings: Listing[]; info: DataInfo; saved: string[]; toggleSaved: (id: string) => void; onDelete: (id: string) => Promise<void> }) {
@@ -402,21 +501,123 @@ function CampusScreen({ go, user, onSave }: { go: GoFn; user: User; onSave: (cha
   return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Campus" /><main className="create-content"><p className="section-kicker">YOUR CAMPUS</p><h1>Where do you <em>sell?</em></h1><form onSubmit={submit}><label>Campus<select name="campus" defaultValue={user.campus || options[0]}>{options.map((campus) => <option key={campus}>{campus}</option>)}</select></label><p className="description">New listings you post will show this campus. Listings you already posted keep the campus they were posted with.</p>{message && <p role={message.error ? "alert" : "status"} style={{ margin: 0, color: message.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{message.text}</p>}<button className="primary-button wide" type="submit">Save campus <Icon name="arrow" size={17} /></button></form></main><BottomNav current="profile" go={go} /></div>;
 }
 
-function AccountScreen({ go, user, onSave }: { go: GoFn; user: User; onSave: (changes: ProfileChanges) => void | Promise<void> }) {
+/** Upload, change and remove the profile picture (online accounts only). */
+function ProfilePhotoEditor({ user, onUpload, onRemove }: { user: User; onUpload: (image: Blob) => Promise<void>; onRemove: () => Promise<void> }) {
+  const [busy, setBusy] = useState<"upload" | "remove" | null>(null);
+  const [note, setNote] = useState<{ text: string; error: boolean } | null>(null);
+  const input = useRef<HTMLInputElement>(null);
+  const hasPhoto = Boolean(user.photoPath);
+  const pick = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = ""; // so choosing the same file again still triggers this
+    if (!file || busy) return;
+    setBusy("upload");
+    setNote(null);
+    try {
+      await onUpload(await prepareAvatar(file));
+      setNote({ text: hasPhoto ? "Profile picture changed." : "Profile picture added.", error: false });
+    } catch (cause) {
+      setNote({ text: describeFirebaseError(cause), error: true });
+    } finally {
+      setBusy(null);
+    }
+  };
+  const remove = async () => {
+    if (busy || !window.confirm("Remove your profile picture?")) return;
+    setBusy("remove");
+    setNote(null);
+    try {
+      await onRemove();
+      setNote({ text: "Profile picture removed.", error: false });
+    } catch (cause) {
+      setNote({ text: describeFirebaseError(cause), error: true });
+    } finally {
+      setBusy(null);
+    }
+  };
+  return <div style={{ marginBottom: 22 }}>
+    <div className={`photo-editor ${busy ? "is-busy" : ""}`} aria-busy={busy !== null}>
+      <span className="profile-avatar"><AvatarFace userId={user.id} version={user.photoUpdatedAt} skip={!hasPhoto} fallback={initialsOf(user.fullName || user.username)} /></span>
+      <div className="photo-actions">
+        <input ref={input} type="file" accept={AVATAR_ACCEPT} hidden onChange={pick} />
+        <button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11 }} onClick={() => input.current?.click()}><Icon name="camera" size={15} /> {busy === "upload" ? "Uploading..." : hasPhoto ? "Change photo" : "Upload photo"}</button>
+        {hasPhoto && <button className="seller-link" type="button" disabled={busy !== null} style={{ margin: 0, color: "#b13a3a" }} onClick={remove}>{busy === "remove" ? "Removing..." : "Remove photo"}</button>}
+        <small>JPG, PNG or WebP, up to {AVATAR_INPUT_MAX_LABEL}. It is resized to fit.</small>
+      </div>
+    </div>
+    {note && <p role={note.error ? "alert" : "status"} style={{ margin: "-10px 0 0", color: note.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{note.text}</p>}
+  </div>;
+}
+
+function AccountScreen({ go, user, onSave, onPhotoUpload, onPhotoRemove }: { go: GoFn; user: User; onSave: (changes: ProfileChanges) => void | Promise<void>; onPhotoUpload: (image: Blob) => Promise<void>; onPhotoRemove: () => Promise<void> }) {
   const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [emailMessage, setEmailMessage] = useState<{ text: string; error: boolean } | null>(null);
+  const [numberRequest, setNumberRequest] = useState<StudentNumberRequest | null>(null);
+  const [numberBusy, setNumberBusy] = useState(false);
+  const [numberMessage, setNumberMessage] = useState<{ text: string; error: boolean } | null>(null);
+  useEffect(() => {
+    if (!firebaseMode) return;
+    let active = true;
+    studentNumberService.get(user.id).then((latest) => { if (active) setNumberRequest(latest); }, () => undefined);
+    return () => { active = false; };
+  }, [user.id]);
+  // Firebase accounts: the sign-in e-mail changes only through Firebase's verification link.
+  const changeEmail = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (emailBusy) return;
+    const form = event.currentTarget;
+    const fields = new FormData(form);
+    setEmailBusy(true);
+    setEmailMessage(null);
+    try {
+      await firebaseAuthService.requestEmailChange(String(fields.get("newEmail") ?? ""), String(fields.get("password") ?? ""));
+      form.reset();
+      setEmailMessage({ text: "Verification link sent. Open it from your new email to finish the change.", error: false });
+    } catch (cause) {
+      setEmailMessage({ text: describeFirebaseError(cause), error: true });
+    } finally {
+      setEmailBusy(false);
+    }
+  };
+  // A student number is tied to the COR, so changing it is a request that an administrator reviews.
+  const requestNumber = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (numberBusy) return;
+    const form = event.currentTarget;
+    const value = String(new FormData(form).get("studentNumber") ?? "");
+    setNumberBusy(true);
+    setNumberMessage(null);
+    try {
+      await studentNumberService.request(user, value);
+      setNumberRequest(await studentNumberService.get(user.id));
+      form.reset();
+      setNumberMessage({ text: "Request sent. An administrator will review it.", error: false });
+    } catch (cause) {
+      setNumberMessage({ text: describeFirebaseError(cause), error: true });
+    } finally {
+      setNumberBusy(false);
+    }
+  };
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (saving) return;
     const fields = new FormData(event.currentTarget);
+    setSaving(true);
+    setMessage(null);
     try {
-      // Firebase accounts: email is tied to sign-in and can't be edited here yet.
+      // Firebase accounts: email is tied to sign-in and changes through the verification form below.
       await onSave({ fullName: String(fields.get("fullName") ?? ""), username: String(fields.get("username") ?? ""), ...(firebaseMode ? {} : { email: String(fields.get("email") ?? "") }) });
       setMessage({ text: "Account updated.", error: false });
     } catch (cause) {
       setMessage({ text: firebaseMode ? describeFirebaseError(cause) : cause instanceof Error ? cause.message : "Unable to update your account.", error: true });
+    } finally {
+      setSaving(false);
     }
   };
   const joined = new Date(user.createdAt);
-  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Account" /><main className="create-content"><p className="section-kicker">YOUR ACCOUNT</p><h1>Account <em>details.</em></h1><form key={`${user.fullName}|${user.username}|${user.email}`} onSubmit={submit}><label>Full Name<input required name="fullName" defaultValue={user.fullName} placeholder="Enter your full name" /></label><label>Username<input required name="username" defaultValue={user.username} placeholder="Enter your username" /></label><label>Campus Email<input required name="email" type="email" defaultValue={user.email} readOnly={firebaseMode} placeholder="name@urs.edu.ph" /></label><p className="description">{Number.isNaN(joined.getTime()) ? "Member of CampusCart" : `Member since ${joined.toLocaleDateString("en-PH", { month: "long", year: "numeric" })}`} · {user.campus || "No campus selected"}{user.studentNumber ? ` · Student no. ${user.studentNumber}` : ""} · {verificationLabel(user)}</p>{message && <p role={message.error ? "alert" : "status"} style={{ margin: 0, color: message.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{message.text}</p>}<button className="primary-button wide" type="submit">Save changes <Icon name="arrow" size={17} /></button></form><button className="outline-button wide" type="button" disabled style={{ width: "100%", marginTop: 22, opacity: 0.55 }}>Change password</button><p className="description" style={{ marginTop: 8 }}>Password changes will be available once online accounts are added. Your password is never shown here.</p></main><BottomNav current="profile" go={go} /></div>;
+  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Account" /><main className="create-content"><p className="section-kicker">YOUR ACCOUNT</p><h1>Account <em>details.</em></h1>{firebaseMode && <ProfilePhotoEditor user={user} onUpload={onPhotoUpload} onRemove={onPhotoRemove} />}<form key={`${user.fullName}|${user.username}|${user.email}`} onSubmit={submit}><label>Full Name<input required name="fullName" defaultValue={user.fullName} placeholder="Enter your full name" /></label><label>Username<input required name="username" defaultValue={user.username} placeholder="Enter your username" /></label><label>Campus Email<input required name="email" type="email" defaultValue={user.email} readOnly={firebaseMode} placeholder="name@urs.edu.ph" /></label><p className="description">{Number.isNaN(joined.getTime()) ? "Member of CampusCart" : `Member since ${joined.toLocaleDateString("en-PH", { month: "long", year: "numeric" })}`} · {user.campus || "No campus selected"}{user.studentNumber ? ` · Student no. ${user.studentNumber}` : ""} · {verificationLabel(user)}</p>{message && <p role={message.error ? "alert" : "status"} style={{ margin: 0, color: message.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{message.text}</p>}<button className="primary-button wide" type="submit" disabled={saving}>{saving ? "Saving..." : "Save changes"} <Icon name="arrow" size={17} /></button></form>{firebaseMode && <form onSubmit={changeEmail} style={{ marginTop: 22 }}><label>New Email<input required name="newEmail" type="email" placeholder="name@urs.edu.ph" autoComplete="email" /></label><label>Current Password<input required name="password" type="password" placeholder="Enter your current password" autoComplete="current-password" /></label><p className="description">We send a verification link to the new address. Your sign-in email changes only after you open it.</p>{emailMessage && <p role={emailMessage.error ? "alert" : "status"} style={{ margin: 0, color: emailMessage.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{emailMessage.text}</p>}<button className="outline-button wide" type="submit" disabled={emailBusy}>{emailBusy ? "Sending..." : "Send verification link"}</button></form>}{firebaseMode && <form onSubmit={requestNumber} style={{ marginTop: 22 }}><label>Change Student Number<input required name="studentNumber" placeholder="Enter your new student number" autoComplete="off" /></label><p className="description">{numberRequest?.status === "pending" ? `Your request to change it to ${numberRequest.requestedNumber} is waiting for administrator review.` : numberRequest?.status === "rejected" ? `Your last request (${numberRequest.requestedNumber}) was not approved.` : "Student numbers are tied to your Certificate of Registration, so a change is reviewed by an administrator."}</p>{numberMessage && <p role={numberMessage.error ? "alert" : "status"} style={{ margin: 0, color: numberMessage.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{numberMessage.text}</p>}<button className="outline-button wide" type="submit" disabled={numberBusy}>{numberBusy ? "Sending..." : "Request change"}</button></form>}<button className="outline-button wide" type="button" disabled style={{ width: "100%", marginTop: 22, opacity: 0.55 }}>Change password</button><p className="description" style={{ marginTop: 8 }}>Password changes will be available once online accounts are added. Your password is never shown here.</p></main><BottomNav current="profile" go={go} /></div>;
 }
 
 function HelpScreen({ go }: { go: GoFn }) {
@@ -438,14 +639,43 @@ function AdminScreen({ go }: { go: GoFn }) {
   const [requests, setRequests] = useState<PendingStudent[] | null>(null);
   const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [numberRequests, setNumberRequests] = useState<StudentNumberReview[]>([]);
   useEffect(() => {
     let active = true;
     adminService.listPending().then(
       (list) => { if (active) setRequests(list); },
       (cause) => { if (active) { setRequests([]); setMessage({ text: describeFirebaseError(cause), error: true }); } },
     );
+    adminService.listStudentNumberRequests().then(
+      (list) => { if (active) setNumberRequests(list); },
+      (cause) => { if (active) setMessage({ text: describeFirebaseError(cause), error: true }); },
+    );
     return () => { active = false; };
   }, []);
+  // Student-number change requests: the administrator checks the student's COR, then approves (which changes the number
+  // and closes the request in one write) or rejects. Verification status is never touched.
+  const reviewNumber = async (request: StudentNumberReview, action: "view" | "approve" | "reject") => {
+    if (busy) return;
+    if (action !== "view" && !window.confirm(`${action === "approve" ? "Approve" : "Reject"} the change to ${request.requestedNumber} for ${request.fullName || request.email}?`)) return;
+    setBusy(request.uid);
+    setMessage(null);
+    const tab = action === "view" ? window.open("", "_blank") : null;
+    try {
+      if (action === "view") {
+        const url = await adminService.getCorUrl(request.uid);
+        if (tab) { tab.opener = null; tab.location.href = url; } else window.location.assign(url);
+      } else {
+        await adminService.reviewStudentNumber(request.uid, action === "approve");
+        setNumberRequests((current) => current.filter((entry) => entry.uid !== request.uid));
+        setMessage({ text: action === "approve" ? "Student number changed." : "Request rejected.", error: false });
+      }
+    } catch (cause) {
+      tab?.close();
+      setMessage({ text: describeFirebaseError(cause), error: true });
+    } finally {
+      setBusy(null);
+    }
+  };
   const run = async (student: PendingStudent, action: "view" | "approve" | "reject") => {
     if (busy) return;
     if (action !== "view" && !window.confirm(`${action === "approve" ? "Approve" : "Reject"} ${student.fullName || student.email}?`)) return;
@@ -469,7 +699,7 @@ function AdminScreen({ go }: { go: GoFn }) {
       setBusy(null);
     }
   };
-  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Verification requests" /><main className="page-content"><p className="section-kicker">STUDENT VERIFICATION</p><h1>Pending <em>requests.</em></h1>{message && <p role={message.error ? "alert" : "status"} style={{ margin: "0 0 10px", color: message.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{message.text}</p>}{requests === null ? <p className="description">Loading...</p> : requests.length === 0 ? <div className="empty-state"><span><Icon name="check" size={33} /></span><h2>No pending requests</h2><p>New student sign-ups waiting for review will appear here.</p></div> : requests.map((student) => <div key={student.id}><div className="profile-card"><span className="profile-avatar">{initialsOf(student.fullName || student.email)}</span><div><h2>{student.fullName || "Unnamed student"}</h2><p>Student no. {student.studentNumber || "-"} · {student.campus || "No campus"}</p><span>{student.email}</span></div></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, margin: "8px 0 18px" }}><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11 }} onClick={() => run(student, "view")}>View COR</button><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11 }} onClick={() => run(student, "approve")}>Approve</button><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11, color: "#b13a3a" }} onClick={() => run(student, "reject")}>Reject</button></div></div>)}</main><BottomNav current="profile" go={go} /></div>;
+  return <div className="screen nav-screen"><Topbar go={go} back="profile" title="Verification requests" /><main className="page-content"><p className="section-kicker">STUDENT VERIFICATION</p><h1>Pending <em>requests.</em></h1>{message && <p role={message.error ? "alert" : "status"} style={{ margin: "0 0 10px", color: message.error ? "#b13a3a" : "var(--blue)", fontSize: 11 }}>{message.text}</p>}{requests === null ? <p className="description">Loading...</p> : requests.length === 0 ? <div className="empty-state"><span><Icon name="check" size={33} /></span><h2>No pending requests</h2><p>New student sign-ups waiting for review will appear here.</p></div> : requests.map((student) => <div key={student.id}><div className="profile-card"><span className="profile-avatar">{initialsOf(student.fullName || student.email)}</span><div><h2>{student.fullName || "Unnamed student"}</h2><p>Student no. {student.studentNumber || "-"} · {student.campus || "No campus"}</p><span>{student.email}</span></div></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, margin: "8px 0 18px" }}><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11 }} onClick={() => run(student, "view")}>View COR</button><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11 }} onClick={() => run(student, "approve")}>Approve</button><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11, color: "#b13a3a" }} onClick={() => run(student, "reject")}>Reject</button></div></div>)}{numberRequests.length > 0 && <><p className="section-kicker">STUDENT NUMBER CHANGES</p>{numberRequests.map((request) => <div key={request.uid}><div className="profile-card"><span className="profile-avatar">{initialsOf(request.fullName || request.email)}</span><div><h2>{request.fullName || "Unnamed student"}</h2><p>Student no. {request.currentNumber || "-"} to {request.requestedNumber}</p><span>{request.email}</span></div></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, margin: "8px 0 18px" }}><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11 }} onClick={() => reviewNumber(request, "view")}>View COR</button><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11 }} onClick={() => reviewNumber(request, "approve")}>Approve</button><button className="outline-button" type="button" disabled={busy !== null} style={{ minHeight: 34, fontSize: 11, color: "#b13a3a" }} onClick={() => reviewNumber(request, "reject")}>Reject</button></div></div>)}</>}</main><BottomNav current="profile" go={go} /></div>;
 }
 
 function MissingListingScreen({ go }: { go: GoFn }) {
@@ -526,6 +756,8 @@ function CreateScreen({ go, onPublish, listing }: { go: GoFn; listing?: Listing;
 function App() {
   const [user, setUser] = useState<User | null>(() => (firebaseMode ? null : authService.getCurrentUser()));
   const [authReady, setAuthReady] = useState(!firebaseMode);
+  // Signed in with Firebase, but the profile could not be read (offline...). Not the same as being logged out.
+  const [authProblem, setAuthProblem] = useState<{ error: string; retrying: boolean } | null>(null);
   // Whether to SHOW admin screens. This is a UI convenience only: the rules and Edge Functions decide what is allowed.
   const [adminFor, setAdminFor] = useState<{ uid: string; admin: boolean } | null>(null);
   // Listings and saved items are subscriptions (Firestore in Firebase mode). Each result is stored with the
@@ -533,10 +765,18 @@ function App() {
   const [listingState, setListingState] = useState<{ key: string; items: Listing[]; error: string | null } | null>(null);
   const [savedState, setSavedState] = useState<{ key: string; ids: string[]; error: string | null } | null>(null);
   const [dataRetry, setDataRetry] = useState(0);
+  // Unread messages of the signed-in user: ONE listener for the whole app. Like the other lists, the result is stored with
+  // the account it belongs to, so another account's (or a logged-out) count can never be shown.
+  const [unreadState, setUnreadState] = useState<{ key: string; entries: UnreadEntry[] } | null>(null);
   const [listingId, setListingId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("id"));
   const [conversationId, setConversationId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("c"));
   const [route, setRoute] = useState<Route>(() => initialGuard(pathToRoute[window.location.pathname] ?? "home"));
   useEffect(() => {
+    // The first entry of this session is the start of the app's own history.
+    const existing: unknown = window.history.state;
+    if (typeof existing !== "object" || existing === null || typeof (existing as { idx?: unknown }).idx !== "number") {
+      window.history.replaceState({ idx: 0, from: null }, "");
+    }
     const onPop = () => {
       setRoute(initialGuard(pathToRoute[window.location.pathname] ?? "home"));
       setListingId(new URLSearchParams(window.location.search).get("id"));
@@ -547,9 +787,10 @@ function App() {
   }, []);
   useEffect(() => {
     if (!firebaseMode) return;
-    return firebaseAuthService.onAuthChange((account) => {
-      setUser(account);
-      setAuthReady(true);
+    return firebaseAuthService.onAuthChange((state) => {
+      setUser(state.status === "ready" ? state.user : null);
+      setAuthReady(state.status !== "initializing");
+      setAuthProblem(state.status === "unavailable" ? { error: state.error, retrying: state.retrying } : null);
     });
   }, []);
   useEffect(() => {
@@ -585,6 +826,21 @@ function App() {
       (cause) => setSavedState({ key, ids: [], error: describeFirebaseError(cause) }),
     );
   }, [authReady, userId, dataRetry]);
+  const unreadUserId = user && canUseMarketplace(user) ? user.id : null;
+  useEffect(() => {
+    if (!authReady || !unreadUserId) return;
+    const key = unreadUserId;
+    return messageService.subscribeUnread(
+      unreadUserId,
+      (entries) => setUnreadState({ key, entries }),
+      (cause) => {
+        // No badge is better than a wrong one. Only the error code is logged (no personal data).
+        console.warn(`[CampusCart] unread count unavailable (${typeof cause === "object" && cause !== null && "code" in cause ? String((cause as { code: unknown }).code) : "unknown"}).`);
+        setUnreadState({ key, entries: [] });
+      },
+    );
+  }, [authReady, unreadUserId]);
+  const unread = useMemo(() => summarizeUnread(unreadState !== null && unreadState.key === unreadUserId ? unreadState.entries : []), [unreadState, unreadUserId]);
   const reloadData = () => { setListingState(null); setSavedState(null); setDataRetry((n) => n + 1); };
   const currentListings = listingState !== null && listingState.key === dataKey ? listingState : null;
   const currentSaved = savedState !== null && savedState.key === dataKey ? savedState : null;
@@ -610,24 +866,41 @@ function App() {
     const missing = saved.filter((id) => !known.has(id));
     if (missing.length) void savedService.pruneMissing(userId, missing);
   }, [listings, saved, userId, listingsStatus, savedStatus]);
-  const go: GoFn = (next, id, actingUser = user) => {
+  const navigateTo = (next: Route, id: string | undefined, actingUser: User | null, replace: boolean) => {
     const destination = guard(next, actingUser);
     const query = (destination === "product" || destination === "edit") && id ? `?id=${encodeURIComponent(id)}` : destination === "chat" && id ? `?c=${encodeURIComponent(id)}` : "";
-    window.history.pushState({}, "", routeToPath[destination] + query);
+    const mark = readHistoryMark(window.history.state);
+    // Each history entry remembers how deep it is and which screen it came from, so Back knows where it leads.
+    if (replace) window.history.replaceState(mark, "", routeToPath[destination] + query);
+    else window.history.pushState({ idx: mark.idx + 1, from: route }, "", routeToPath[destination] + query);
     if (destination === "product" || destination === "edit") setListingId(id ?? null);
     if (destination === "chat") setConversationId(id ?? null);
     setRoute(destination);
     window.scrollTo(0, 0);
   };
+  const go: GoFn = (next, id, actingUser = user) => navigateTo(next, id, actingUser, false);
+  // Android Back: first a transient screen (e.g. editing a message), then normal back navigation.
+  const handleBack = (): "handled" | "exit" => {
+    if (runBackInterceptors()) return "handled";
+    if (!authReady || authProblem) return "exit";
+    const action = decideBack({ route, signedIn: user !== null, mark: readHistoryMark(window.history.state) });
+    if (action.type === "exit") return "exit";
+    if (action.type === "history") window.history.back();
+    else navigateTo(isRoute(action.route) ? action.route : "home", undefined, user, true);
+    return "handled";
+  };
+  const backHandler = useRef(handleBack);
+  useEffect(() => { backHandler.current = handleBack; });
+  useEffect(() => installAndroidBackButton(() => backHandler.current()), []);
   const onAuthenticated = (account: User) => {
     setUser(account);
     // Students who are not verified yet land on Profile, where their status is shown.
     go(canUseMarketplace(account) ? "home" : "profile", undefined, account);
   };
   const onLogout = () => {
-    if (firebaseMode) void firebaseAuthService.logout(); else authService.logout();
+    if (firebaseMode) firebaseAuthService.logout().catch(() => undefined); else authService.logout();
     setUser(null);
-    window.history.replaceState({}, "", routeToPath.welcome);
+    window.history.replaceState({ idx: 0, from: null }, "", routeToPath.welcome);
     setRoute("welcome");
     window.scrollTo(0, 0);
   };
@@ -673,6 +946,14 @@ function App() {
     if (firebaseMode) return firebaseAuthService.updateProfile(user, changes).then((updated) => applyProfile(updated, changes));
     applyProfile(authService.updateProfile(user.id, changes), changes);
   };
+  const uploadPhoto = async (image: Blob): Promise<void> => {
+    if (!user) throw new Error("Please log in to change your picture.");
+    setUser(await firebaseAuthService.updateProfilePhoto(user, image));
+  };
+  const removePhoto = async (): Promise<void> => {
+    if (!user) throw new Error("Please log in to change your picture.");
+    setUser(await firebaseAuthService.removeProfilePhoto(user));
+  };
   const refreshStatus = async () => { await firebaseAuthService.refreshCurrentUser().catch(() => undefined); };
   const loginScreen = <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />;
   const editing = user ? listings.find((item) => item.id === listingId && item.sellerId === user.id) : undefined;
@@ -681,12 +962,13 @@ function App() {
     mylistings: user ? <MyListingsScreen go={go} user={user} listings={listings} info={listingsInfo} saved={saved} toggleSaved={toggleSaved} onDelete={deleteListing} /> : loginScreen,
     edit: !user ? loginScreen : !canUseMarketplace(user) ? <RestrictedScreen go={go} user={user} /> : editing ? <CreateScreen key={editing.id} go={go} listing={editing} onPublish={editListing} /> : listingsInfo.status !== "ready" ? <div className="screen nav-screen"><Topbar go={go} back="mylistings" title="Edit listing" /><main className="page-content"><DataNotice info={listingsInfo} go={go} what="this listing" /></main></div> : <MissingListingScreen go={go} />,
     campus: user ? <CampusScreen go={go} user={user} onSave={saveProfile} /> : loginScreen,
-    account: user ? <AccountScreen go={go} user={user} onSave={saveProfile} /> : loginScreen,
+    account: user ? <AccountScreen go={go} user={user} onSave={saveProfile} onPhotoUpload={uploadPhoto} onPhotoRemove={removePhoto} /> : loginScreen,
     help: user ? <HelpScreen go={go} /> : loginScreen,
-    welcome: <WelcomeScreen go={go} />, home: <HomeScreen go={go} listings={listings} info={listingsInfo} saved={saved} toggleSaved={toggleSaved} />, login: <AuthScreen key="login" mode="login" go={go} onAuthenticated={onAuthenticated} />, signup: <AuthScreen key="signup" mode="signup" go={go} onAuthenticated={onAuthenticated} />, product: <ProductScreen key={listingId ?? "none"} go={go} item={listings.find((item) => item.id === listingId)} info={listingsInfo} saved={saved} toggleSaved={toggleSaved} onMessageSeller={messageSeller} />, saved: <SavedScreen go={go} listings={listings} info={savedInfo} saved={saved} toggleSaved={toggleSaved} />, messages: user ? (canUseMarketplace(user) ? <MessagesScreen go={go} user={user} /> : <RestrictedScreen go={go} user={user} />) : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, chat: user ? (!canUseMarketplace(user) ? <RestrictedScreen go={go} user={user} /> : <ChatScreen key={conversationId ?? "none"} go={go} user={user} conversationId={conversationId} listings={listings} />) : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, profile: user ? <ProfileScreen go={go} user={user} onLogout={onLogout} onRefreshStatus={refreshStatus} showAdmin={adminState === "yes"} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, create: user ? (canUseMarketplace(user) ? <CreateScreen go={go} onPublish={publish} /> : <RestrictedScreen go={go} user={user} />) : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />,
+    welcome: <WelcomeScreen go={go} />, home: <HomeScreen go={go} listings={listings} info={listingsInfo} saved={saved} toggleSaved={toggleSaved} />, login: <AuthScreen key="login" mode="login" go={go} onAuthenticated={onAuthenticated} />, signup: <AuthScreen key="signup" mode="signup" go={go} onAuthenticated={onAuthenticated} />, product: <ProductScreen key={listingId ?? "none"} go={go} item={listings.find((item) => item.id === listingId)} info={listingsInfo} saved={saved} toggleSaved={toggleSaved} onMessageSeller={messageSeller} />, saved: <SavedScreen go={go} listings={listings} info={savedInfo} saved={saved} toggleSaved={toggleSaved} />, messages: user ? (canUseMarketplace(user) ? <MessagesScreen go={go} user={user} /> : <RestrictedScreen go={go} user={user} />) : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, chat: user ? (!canUseMarketplace(user) ? <RestrictedScreen go={go} user={user} /> : <ChatScreen key={conversationId ?? "none"} go={go} user={user} conversationId={conversationId} listings={listings} />) : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, profile: user ? <ProfileScreen go={go} user={user} onLogout={onLogout} onRefreshStatus={refreshStatus} onResubmitCor={(file) => firebaseAuthService.resubmitCor(file)} showAdmin={adminState === "yes"} /> : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />, create: user ? (canUseMarketplace(user) ? <CreateScreen go={go} onPublish={publish} /> : <RestrictedScreen go={go} user={user} />) : <AuthScreen mode="login" go={go} onAuthenticated={onAuthenticated} />,
   };
+  if (authProblem) return <div className="app-shell"><div className="screen"><main className="page-content"><div className="empty-state"><span><Icon name="search" size={33} /></span><h2>Can&apos;t reach CampusCart</h2><p>{authProblem.error} You&apos;re still signed in, and we&apos;ll reconnect automatically.</p><button className="primary-button" type="button" disabled={authProblem.retrying} onClick={() => { firebaseAuthService.retryProfile().catch(() => undefined); }}>{authProblem.retrying ? "Checking..." : "Try again"}</button><button className="logout" type="button" onClick={onLogout}>Log out</button></div></main></div></div>;
   if (!authReady) return <div className="app-shell"><div className="screen"><main className="page-content"><p className="section-kicker">LOADING...</p></main></div></div>;
-  return <div className="app-shell">{screens[route]}</div>;
+  return <UserContext.Provider value={user}><UnreadContext.Provider value={unread}><div className="app-shell">{screens[route]}</div></UnreadContext.Provider></UserContext.Provider>;
 }
 
 export default App;

@@ -118,7 +118,7 @@ Without the `VITE_*` values the old local prototype still runs (with its demo li
 | `listings/{listingId}` | title, price, condition, category, description, images, sellerId, sellerName, campus, createdAt | any signed-in user reads; only a VERIFIED student creates (sellerId must be their uid; name and campus must match their profile); only the owner edits or deletes; sellerId, campus and createdAt never change |
 | `users/{uid}/saved/{listingId}` | listingId, savedAt | only that user, only for a listing that exists; pending/rejected students may save |
 | `conversations/{listingId}_{buyerUid}` | listingId, listingTitle, listingPrice, buyerId, buyerName, sellerId, sellerName, participants, lastMessage, lastMessageId, createdAt, updatedAt | only the buyer and the seller read; only a verified buyer creates (the seller must be the listing's real seller; the id makes duplicates impossible); participants/listing never change; admins get no access |
-| `conversations/{id}/messages/{messageId}` | conversationId, senderId, text (1-1000 chars), createdAt | only the two participants read; only a verified participant sends, as themselves; never edited or deleted |
+| `conversations/{id}/messages/{messageId}` | conversationId, senderId, text (1-1000 chars), createdAt, editedAt (only after an edit) | only the two participants read; only a verified participant sends, as themselves; only the SENDER can edit (text and editedAt only) or delete their own message |
 
 Verification is read from the SERVER-side `users/{uid}.verificationStatus` (students cannot change it), so pending and
 rejected students are blocked by the rules themselves, not only by the screens. No new indexes are needed.
@@ -131,7 +131,7 @@ error. Run the tests below first, then Firebase Console > Firestore > Rules > pa
 ### Tests (emulator, needs Java; uses demo data only, never your real project)
 ```
 npm.cmd install -D @firebase/rules-unit-testing      # once, dev-only
-npx.cmd firebase-tools emulators:exec --only firestore --project demo-campuscart "node rules-tests/firestore.rules.test.mjs && node rules-tests/marketplace.rules.test.mjs"
+npx.cmd firebase-tools emulators:exec --only firestore --project demo-campuscart "node rules-tests/firestore.rules.test.mjs && node rules-tests/marketplace.rules.test.mjs && node rules-tests/profile-and-messages.rules.test.mjs"
 ```
 `firestore.rules.test.mjs` covers verification and admin review (one line changed: the "default-deny" check now uses an
 unknown collection, because `listings` is a real collection now). `marketplace.rules.test.mjs` covers listings, saved
@@ -141,9 +141,16 @@ items, conversations and messages.
 ```
 node tests/service/run.mjs
 ```
-Runs the marketplace client code against an in-memory fake Firestore (40 checks): document shapes, ownership, one
+Runs the client code against an in-memory fake Firestore and fake Auth (131 checks): document shapes, ownership, one
 conversation per listing and buyer, atomic message batches, subscriptions, "Firebase mode never touches localStorage",
-and that local mode still works. It does NOT test the real Firestore or the security rules; use the emulator tests above for that.
+that local mode still works, and the offline / session behaviour described below. It does NOT test the real Firestore or the security rules; use the emulator tests above for that.
+
+### Offline and session behaviour
+Firebase keeps the signed-in session in the browser, so a refresh or a short outage does not sign anyone out. CampusCart
+loads the student's profile on top of that session. If the profile cannot be read (offline, timeout, permission problem) the
+app shows "Can't reach CampusCart" with Try again and Log out, keeps the session, unlocks nothing, and retries by itself
+(after 3, 6, 12, 24, then every 30 seconds, and immediately when the browser goes back online). Only two things sign a user
+out: pressing Log out, or the SERVER confirming that the account has no profile (an unfinished registration).
 
 ### Two-browser check (needs the published rules and two approved students, A and B)
 1. A (browser 1) creates a listing with a photo. B (browser 2, or a private window) sees it appear without refreshing.
@@ -162,6 +169,47 @@ else's data to the wrong person. Demo listings were never meant for production. 
 from your Firebase account (the photos can be re-added). Old chats and saved ids cannot be carried over (the other
 person and the listing ids only exist locally).
 
+## Android back, message editing, COR resubmission and profile editing
+
+### One-time steps on your machine
+1. **Android Back button** needs the official Capacitor App plugin on the native side (Capacitor itself has no back handling,
+   which is why Back used to close the app):
+   ```
+   npm.cmd install @capacitor/app
+   npx.cmd cap sync android
+   ```
+   then rebuild the APK. Until then the app behaves exactly as before. The web build never needs it.
+2. **Redeploy the `submit-cor` Edge Function** (the only function that changed; secrets stay as they are):
+   ```
+   npx.cmd supabase functions deploy submit-cor --no-verify-jwt
+   ```
+3. Run the three emulator rules tests (command above). **Only if they all pass**, publish `firestore.rules`
+   (Firebase Console > Firestore > Rules > Publish). Until the rules are published, message editing/deleting, resubmission,
+   e-mail sync and student-number requests are refused by Firestore; everything that worked before keeps working.
+
+### What changed
+| Feature | How it works |
+|---|---|
+| Android Back | Each history entry remembers its depth and the screen it came from. Back goes to the previous screen; on the main marketplace screen it exits; after a refresh on a deep screen it goes UP to the parent; a signed-in student is never sent back to login/welcome and is never logged out. While editing a message, Back cancels the edit first. The top-bar arrow now really goes back when the previous screen is its target, so history does not pile up. |
+| Edit message | Tap one of your own messages, then Edit. The text goes into the normal composer with an "Editing message / Cancel" strip; Save writes `text` + `editedAt` (shown as "edited"). If it is the latest message the conversation preview follows. |
+| Delete message | Tap your own message, then Delete (confirmation). Only that message is removed. If it was the latest, the conversation preview, `lastMessageId` and `updatedAt` move to the newest remaining message (or the preview empties and `updatedAt` returns to when the conversation started), in the same transaction. A message that is already gone counts as deleted. |
+| COR resubmission | A rejected student sees a file picker on their Profile. The `submit-cor` function stores the new file over the old one (same private path, nothing left behind) and ONLY THEN reopens the request as `pending`, clears `reviewedAt` and the old `corVerifiedAt` (so the new file must be verified again), using the attestor account. Students never write their own status. Pending and approved students are refused. |
+| Name / username / campus | Validated (name 2-100 characters, username 3-50 without spaces); only changed fields are written; seller and conversation names re-sync as before. Verification status can never change from here. |
+| E-mail | Account > "New Email" re-checks the password, then Firebase sends a verification link to the new address (`verifyBeforeUpdateEmail`). The sign-in e-mail changes only after the link is opened; the profile's copy then follows automatically (the rules accept exactly the verified e-mail in the token, and nothing else). |
+| Student number | Not directly editable (it is tied to the COR). The student files a request (`studentNumberRequests/{uid}`); the administrator reviews it on the Admin screen (View COR, Approve, Reject). Approving changes the number AND closes the request in one write; the rules refuse one without the other. Verification status is untouched. |
+| Profile picture | Not implemented (see limitations). |
+
+### Tests added
+- `node tests/service/run.mjs`: 131 checks (navigation and the Android listener lifecycle, message edit/delete on both backends, resubmission, profile, e-mail, student-number review).
+- `node tests/functions/run.mjs`: 22 checks of the `submit-cor` signup and resubmission logic and `verify-cor` (needs Node 22+).
+- `rules-tests/profile-and-messages.rules.test.mjs`: 39 emulator checks for the new rules. In `marketplace.rules.test.mjs` the old "messages are immutable" check was updated: only the sender may edit or delete.
+
+### Manual checks that need a phone or two accounts
+1. Android: open several screens, press Back (returns to the previous screen), reach Home, press Back (exits). Refresh-equivalent: open a chat from a notification-less cold start and press Back (goes to Messages).
+2. Two phones/browsers: A edits and deletes own messages; B sees both live; A has no Edit/Delete on B's messages; deleting the latest message updates the preview in the Messages list.
+3. Rejected account: upload a corrected COR; status becomes Pending; the admin sees it, View COR opens the new file, Approve works only after the new file passes verification; a failed upload (airplane mode) leaves it Rejected.
+4. Profile: change name/username/campus and check listings and chats show the new name; request an e-mail change, open the link, log in with the new e-mail; request a student-number change and approve it as admin.
+
 ## Data model
 `users/{uid}`: fullName, username, email, studentNumber, campus, verificationStatus ("pending"|"approved"|"rejected"),
 corStoragePath (`{uid}/cor`, a path in the private bucket, never a URL), createdAt, verifiedAt, reviewedAt, and
@@ -173,7 +221,6 @@ corVerifiedAt (written only by the attestor account via `verify-cor`).
 - The rules cannot see Supabase, so a student could create a profile without uploading; the admin then sees "No COR was found" and `verify-cor` blocks approval.
 - Each unfinished signup can leave at most one file (`<uid>/cor`, max 10 MB) behind; clean up in the Supabase dashboard if needed.
 - The functions are publicly reachable (no per-user rate limit), so hostile traffic could consume the free invocation quota.
-- Rejected students cannot resubmit yet (a later feature, which must also clear `corVerifiedAt`).
 - Supabase Free projects pause after about 7 days of inactivity; signup and COR viewing stop until you restore the project.
 - The admin screen opens signed links in a new tab; Android WebViews don't render PDFs inline, so review on the web build.
 - Listing photos are stored inside the listing document (at most 5 photos, about 900 KB in total, because a Firestore document is limited to 1 MiB). Only the newest 100 listings are loaded (no pagination yet), so a saved listing older than that is not shown on the Saved page.
@@ -183,3 +230,40 @@ corVerifiedAt (written only by the attestor account via `verify-cor`).
 - Deleting a listing cannot reach other users' saved lists; each user's app removes its own dangling ids the next time it loads. Conversations about a deleted listing remain, showing the title saved at the time.
 - Writes made while offline wait until the connection returns, so "Publishing..." can stay on screen; do not submit twice or you may create two listings.
 - Not built yet: unread counts, notifications, read receipts, typing or online status ("Active now" in the chat header is still the original static label).
+- Profile pictures are not supported: there is no field for one and no place to put the image. Firebase Storage needs a paid plan, the Supabase bucket is private and reserved for CORs, and a data URL in the profile document would only be visible to its owner. Decide where pictures should live (and who may see them) before this is built.
+- When a message is deleted, the conversation preview is chosen from the newest remaining message the app could see. If another message arrives at the same moment, the transaction notices and leaves the newer preview alone.
+- Message edit and delete need an internet connection (they are transactions); sending still queues offline as before.
+- A resubmission replaces the stored COR before the status is reopened. If that second step fails the new file is already stored but the student stays "rejected" and can simply try again.
+- Android Back needs the native `@capacitor/app` plugin; I could not test it on a device.
+
+
+## Profile pictures and unread message counts
+
+### What was added
+- **Edge Function `profile-picture`** (POST = upload/replace, DELETE = remove). Sign-in is checked with the Firebase ID token and the storage path `profile-pictures/{uid}/avatar` is derived from the verified token only. Size (2 MB) and the real image type (JPEG/PNG/WebP, from the file's bytes) are checked again on the server.
+- **Firestore rules**: a student may change only `photoPath` / `photoUpdatedAt` of their own profile, and only to their own path; and a new `users/{uid}/unread/{messageId}` marker collection (one tiny document per unread message).
+- **Nothing else changes**: no new Storage policies are needed (the bucket is public for reading; every write goes through the Edge Function with the service-role key). No new secrets or `.env` values.
+
+### Deployment order (do these only when you are ready; nothing was deployed for you)
+Rules FIRST, then the function, then the new app build. The new app writes an unread marker with every message, so installing the new app before the rules would make sending messages fail.
+
+1. Firestore rules: `npx.cmd firebase-tools deploy --only firestore:rules`
+2. Edge Function: `npx.cmd supabase functions deploy profile-picture --no-verify-jwt`
+   (`supabase/config.toml` already sets `verify_jwt = false` for it, like the other functions.)
+3. Build and release the web app / Android APK as you normally do (`npm.cmd run build`, `npx.cmd cap sync android`, ...).
+
+The `profile-picture` function uses the secrets the other functions already use (`FIREBASE_PROJECT_ID`, `ALLOWED_ORIGINS`, and the Supabase-provided `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`). Its CORS rules are the same as `submit-cor`, so the Android origin that works today works here too.
+
+### Tests
+```
+npm.cmd run build
+npm.cmd run lint
+node tests/service/run.mjs
+node tests/functions/run.mjs
+npx.cmd firebase-tools emulators:exec --only firestore --project demo-campuscart "node rules-tests/firestore.rules.test.mjs && node rules-tests/marketplace.rules.test.mjs && node rules-tests/profile-and-messages.rules.test.mjs && node rules-tests/avatar-and-unread.rules.test.mjs"
+```
+
+### Notes
+- Messages that were sent before this update have no unread marker, so they are never counted as unread (the badge starts at zero for old conversations).
+- Messages sent from an old app version (before updating) do not create a marker, so the recipient's badge will not count them.
+- Other students see a changed picture after the browser cache expires (up to 5 minutes). The owner sees it immediately.

@@ -147,7 +147,9 @@ await test("a message cannot be written without its matching conversation update
   await assertFails(sendBatch(as("B"), "L1_B", "B", "real text", { lastMessageId: "DOESNOTEXIST" })); });
 await test("last-message fields cannot be changed without a message at all", async () => { await assertFails(updateDoc(doc(as("B"), "conversations/L1_B"), { lastMessage: "forged", lastMessageId: "M1", updatedAt: serverTimestamp() })); });
 await test("message conversationId/extra fields/client timestamps are rejected", async () => { for (const o of [{ conversationId: "OTHER" }, { extra: 1 }, { createdAt: Timestamp.now() }]) await assertFails(setDoc(doc(as("B"), "conversations/L1_B/messages/X1"), { conversationId: "L1_B", senderId: "B", text: "hi", createdAt: serverTimestamp(), ...o })); });
-await test("messages cannot be edited or deleted by anyone", async () => { for (const u of ["A", "B", "ADMIN"]) { await assertFails(updateDoc(doc(as(u), "conversations/L1_B/messages/M1"), { text: "changed" })); await assertFails(deleteDoc(doc(as(u), "conversations/L1_B/messages/M1"))); } });
+// Messages are no longer immutable: their SENDER may edit or delete them (all the positive and negative cases are in
+// profile-and-messages.rules.test.mjs). Here: nobody else can, and an edit must carry a server-time editedAt.
+await test("messages can only be changed or deleted by their SENDER (M1 was sent by B)", async () => { for (const u of ["A", "ADMIN"]) { await assertFails(updateDoc(doc(as(u), "conversations/L1_B/messages/M1"), { text: "changed", editedAt: serverTimestamp() })); await assertFails(deleteDoc(doc(as(u), "conversations/L1_B/messages/M1"))); } await assertFails(updateDoc(doc(as("B"), "conversations/L1_B/messages/M1"), { text: "changed" })); });
 
 // ============================== existing protections still hold ==============================
 await test("verification fields are still untouchable by students, and admin/attestor docs by everyone", async () => {

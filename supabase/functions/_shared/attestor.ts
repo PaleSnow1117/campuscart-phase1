@@ -49,3 +49,36 @@ export async function markCorVerified(projectId: string, studentUid: string): Pr
     throw new UpstreamError(`Firestore write failed (${response.status})`);
   }
 }
+
+/**
+ * Moves a REJECTED student back to "pending" after a corrected COR was stored, and clears the old review data
+ * (reviewedAt) and the old attestation (corVerifiedAt), so the new file must be verified again before approval.
+ * The update only applies if the profile has not changed since it was read (updateTime precondition), and the
+ * Firestore rules only let the attestor make exactly this change on a profile that is currently "rejected".
+ */
+export async function markResubmitted(projectId: string, studentUid: string, updateTime: string): Promise<void> {
+  const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${studentUid}` +
+    `?updateMask.fieldPaths=verificationStatus&updateMask.fieldPaths=reviewedAt&updateMask.fieldPaths=corVerifiedAt` +
+    `&currentDocument.updateTime=${encodeURIComponent(updateTime)}`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${await attestorToken()}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: { verificationStatus: { stringValue: "pending" }, reviewedAt: { nullValue: null }, corVerifiedAt: { nullValue: null } } }),
+    });
+  } catch (error) {
+    if (error instanceof UpstreamError) throw error;
+    throw new UpstreamError("Firestore unreachable");
+  }
+  await response.body?.cancel();
+  if (response.status === 404) throw new HttpError(404, "Your profile could not be found.");
+  if (response.status === 400 || response.status === 409 || response.status === 412) {
+    // The profile changed while the file was uploading (e.g. an administrator acted on it).
+    throw new HttpError(409, "Your verification status changed while uploading. Please refresh and try again.");
+  }
+  if (!response.ok) {
+    cached = null;
+    throw new UpstreamError(`Firestore write failed (${response.status})`);
+  }
+}

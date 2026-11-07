@@ -2,7 +2,7 @@ import { isFirebaseConfigured } from "./firebase";
 import { firestoreMessages } from "./firestoreMarketplace";
 import { formatSellerName } from "./listingHelpers";
 import { localBus } from "./localBus";
-import type { Conversation, Listing, Message, Unsubscribe, User } from "./types";
+import type { Conversation, Listing, Message, UnreadEntry, Unsubscribe, User } from "./types";
 import { canUseMarketplace, verificationNotice } from "./verification";
 
 // Messaging. When Firebase is configured, conversations and messages live in Firestore and update live
@@ -16,14 +16,20 @@ type MessageBackend = {
   subscribeConversation(conversationId: string, userId: string, onData: (item: Conversation | null) => void, onError: OnError): Unsubscribe;
   subscribeMessages(conversationId: string, userId: string, onData: (items: Message[]) => void, onError: OnError): Unsubscribe;
   getOrCreateConversation(listing: Listing, buyer: User | null): Promise<Conversation>;
-  send(conversationId: string, sender: User | null, text: string): Promise<void>;
+  /** `recipientId` (the other participant) saves a lookup; it is worked out from the conversation when omitted. */
+  send(conversationId: string, sender: User | null, text: string, recipientId?: string): Promise<void>;
+  edit(conversationId: string, messageId: string, editor: User | null, text: string): Promise<void>;
+  remove(conversationId: string, messageId: string, user: User | null): Promise<void>;
   syncUserName(user: User): Promise<void>;
+  subscribeUnread(userId: string, onData: (items: UnreadEntry[]) => void, onError: OnError): Unsubscribe;
+  markRead(userId: string, messageIds: string[]): Promise<void>;
 };
 
 // ---- local (localStorage) backend: used only when Firebase is not configured -----------------------------
 
 const CONVERSATIONS_KEY = "campuscart.conversations";
 const MESSAGES_KEY = "campuscart.messages";
+const UNREAD_KEY = "campuscart.unread";
 const MAX_MESSAGE_LENGTH = 1000;
 
 function readList<T>(key: string, isValid: (entry: unknown) => entry is T): T[] {
@@ -61,6 +67,14 @@ const isMessage = (entry: unknown): entry is Message =>
   typeof entry.senderId === "string" &&
   typeof entry.text === "string" &&
   typeof entry.createdAt === "string";
+
+/** Local stand-in for users/{recipient}/unread/{messageId}: one marker per unread message. */
+type LocalUnread = { messageId: string; conversationId: string; recipientId: string };
+
+const isLocalUnread = (entry: unknown): entry is LocalUnread =>
+  isRecord(entry) && typeof entry.messageId === "string" && typeof entry.conversationId === "string" && typeof entry.recipientId === "string";
+
+const readUnread = () => readList(UNREAD_KEY, isLocalUnread);
 
 const readConversations = () => readList(CONVERSATIONS_KEY, isConversation);
 const readMessages = () => readList(MESSAGES_KEY, isMessage);
@@ -102,6 +116,13 @@ function localMessages(conversationId: string, userId: string): Message[] {
   return readMessages()
     .filter((message) => message.conversationId === conversationId)
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+/** The newest message of a conversation (by time), or undefined. */
+function newestMessage(messages: Message[], conversationId: string): Message | undefined {
+  return messages
+    .filter((entry) => entry.conversationId === conversationId)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
 }
 
 const localBackend: MessageBackend = {
@@ -162,13 +183,58 @@ const localBackend: MessageBackend = {
       text: body,
       createdAt: now,
     };
+    const recipientId = conversation.buyerId === sender.id ? conversation.sellerId : conversation.buyerId;
     writeList(MESSAGES_KEY, [...readMessages(), message]);
+    writeList(UNREAD_KEY, [...readUnread(), { messageId: message.id, conversationId, recipientId }]);
     writeList(
       CONVERSATIONS_KEY,
       conversations.map((entry) =>
         entry.id === conversationId ? { ...entry, lastMessage: body, updatedAt: now } : entry,
       ),
     );
+    localBus.notify();
+  },
+
+  async edit(conversationId, messageId, editor, text) {
+    if (!editor) throw new Error("Please log in to edit messages.");
+    if (!canUseMarketplace(editor)) throw new Error(verificationNotice(editor));
+    const body = text.trim();
+    if (!body) throw new Error("Please write a message first.");
+    if (body.length > MAX_MESSAGE_LENGTH) throw new Error(`Messages can be up to ${MAX_MESSAGE_LENGTH} characters.`);
+    const messages = readMessages();
+    const message = messages.find((entry) => entry.id === messageId && entry.conversationId === conversationId);
+    if (!message) throw new Error("That message is no longer available.");
+    if (message.senderId !== editor.id) throw new Error("You can only edit your own messages.");
+    const conversations = readConversations();
+    const conversation = conversations.find((entry) => entry.id === conversationId);
+    if (!conversation || !isParticipant(conversation, editor.id)) throw new Error("This conversation is not available.");
+    const newest = newestMessage(messages, conversationId);
+    writeList(MESSAGES_KEY, messages.map((entry) => (entry.id === messageId ? { ...entry, text: body, editedAt: new Date().toISOString() } : entry)));
+    if (newest?.id === messageId) {
+      writeList(CONVERSATIONS_KEY, conversations.map((entry) => (entry.id === conversationId ? { ...entry, lastMessage: body } : entry)));
+    }
+    localBus.notify();
+  },
+
+  async remove(conversationId, messageId, user) {
+    if (!user) throw new Error("Please log in to delete messages.");
+    const messages = readMessages();
+    const message = messages.find((entry) => entry.id === messageId && entry.conversationId === conversationId);
+    if (!message) return; // already deleted
+    if (message.senderId !== user.id) throw new Error("You can only delete your own messages.");
+    const conversations = readConversations();
+    const conversation = conversations.find((entry) => entry.id === conversationId);
+    if (!conversation || !isParticipant(conversation, user.id)) throw new Error("This conversation is not available.");
+    const wasLatest = newestMessage(messages, conversationId)?.id === messageId;
+    const remaining = messages.filter((entry) => entry.id !== messageId);
+    writeList(MESSAGES_KEY, remaining);
+    writeList(UNREAD_KEY, readUnread().filter((entry) => entry.messageId !== messageId));
+    if (wasLatest) {
+      const next = newestMessage(remaining, conversationId);
+      writeList(CONVERSATIONS_KEY, conversations.map((entry) => (entry.id === conversationId
+        ? { ...entry, lastMessage: next ? next.text : "", updatedAt: next ? next.createdAt : entry.createdAt }
+        : entry)));
+    }
     localBus.notify();
   },
 
@@ -189,6 +255,24 @@ const localBackend: MessageBackend = {
     );
     localBus.notify();
   },
+
+  subscribeUnread: (userId, onData, onError) =>
+    localSubscribe(
+      () => readUnread()
+        .filter((entry) => entry.recipientId === userId)
+        .map((entry) => ({ messageId: entry.messageId, conversationId: entry.conversationId })),
+      onData,
+      onError,
+    ),
+
+  async markRead(userId, messageIds) {
+    const ids = new Set(messageIds);
+    const all = readUnread();
+    const remaining = all.filter((entry) => !(entry.recipientId === userId && ids.has(entry.messageId)));
+    if (remaining.length === all.length) return;
+    writeList(UNREAD_KEY, remaining);
+    localBus.notify();
+  },
 };
 
 // ---- public API ----------------------------------------------------------------------------------------------
@@ -200,7 +284,11 @@ const firestoreBackend: MessageBackend = {
   subscribeMessages: (conversationId, _userId, onData, onError) => firestoreMessages.subscribeMessages(conversationId, onData, onError),
   getOrCreateConversation: firestoreMessages.getOrCreateConversation,
   send: firestoreMessages.send,
+  edit: firestoreMessages.edit,
+  remove: firestoreMessages.remove,
   syncUserName: firestoreMessages.syncUserName,
+  subscribeUnread: firestoreMessages.subscribeUnread,
+  markRead: firestoreMessages.markRead,
 };
 
 const backend: MessageBackend = isFirebaseConfigured ? firestoreBackend : localBackend;
@@ -216,8 +304,45 @@ export const messageService = {
   getOrCreateConversation: backend.getOrCreateConversation,
   /** Sends a message. It appears through the subscription (immediately, even before the server confirms). */
   send: backend.send,
+  /** Edits your own message (the preview follows if it is the latest). */
+  edit: backend.edit,
+  /** Deletes your own message (the preview moves to the newest remaining one if it was the latest). */
+  remove: backend.remove,
   syncUserName: backend.syncUserName,
+  /** Live unread markers of the signed-in user across all conversations (one listener; at most one marker per message). */
+  subscribeUnread: backend.subscribeUnread,
+  /** Marks messages as read (their markers disappear everywhere, on every device). Repeating it is harmless. */
+  markRead: backend.markRead,
 };
+
+/** The other person in a conversation, from the viewer's point of view. */
+export function otherPartyId(conversation: Conversation, userId: string): string {
+  return conversation.buyerId === userId ? conversation.sellerId : conversation.buyerId;
+}
+
+/** Unread messages grouped for the UI. `total` counts each message once. */
+export type UnreadSummary = { total: number; idsByConversation: Map<string, string[]> };
+
+export function summarizeUnread(entries: UnreadEntry[]): UnreadSummary {
+  const seen = new Set<string>();
+  const idsByConversation = new Map<string, string[]>();
+  for (const entry of entries) {
+    if (seen.has(entry.messageId)) continue;
+    seen.add(entry.messageId);
+    const ids = idsByConversation.get(entry.conversationId);
+    if (ids) ids.push(entry.messageId);
+    else idsByConversation.set(entry.conversationId, [entry.messageId]);
+  }
+  return { total: seen.size, idsByConversation };
+}
+
+export const UNREAD_BADGE_MAX = 99;
+
+/** Text for an unread badge: "" for none (no badge is shown), the number up to 99, then "99+". */
+export function formatUnreadBadge(count: number): string {
+  if (!Number.isFinite(count) || count < 1) return "";
+  return count > UNREAD_BADGE_MAX ? `${UNREAD_BADGE_MAX}+` : String(Math.floor(count));
+}
 
 /** Other person's display name from the viewer's point of view. */
 export function otherPartyName(conversation: Conversation, userId: string): string {

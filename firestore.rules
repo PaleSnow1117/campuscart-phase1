@@ -56,6 +56,19 @@ service cloud.firestore {
         && shortText(d.campus, 100);
     }
 
+    // Profile picture: the student may change ONLY photoPath and photoUpdatedAt, and only to exactly "no picture"
+    // (both null) or to THEIR OWN storage path with a server timestamp. The file itself is written by the
+    // profile-picture Edge Function (service-role key, uid taken from the verified token); a path pointing at
+    // anyone else's folder, an arbitrary string, or a client-supplied time is refused. Works for every
+    // verification status (pending and rejected students may have a picture too).
+    function studentPhotoChange(uid) {
+      let d = request.resource.data;
+      return isOwner(uid)
+        && d.diff(resource.data).affectedKeys().hasOnly(['photoPath', 'photoUpdatedAt'])
+        && ((d.photoPath == null && d.photoUpdatedAt == null)
+            || (d.photoPath == uid + '/avatar' && d.photoUpdatedAt == request.time));
+    }
+
     // The admin may change only the decision fields. Approval also requires corVerifiedAt, which only the
     // attestor account (driven by the verify-cor Edge Function) can set.
     function adminReview() {
@@ -199,6 +212,142 @@ service cloud.firestore {
         && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
     }
 
+    // ---- editing and deleting messages ----
+    // Only the SENDER can change or remove a message. An edit may touch nothing but text and editedAt; senderId,
+    // conversationId and createdAt can never change.
+    function validMessageEdit(conversationId) {
+      let d = request.resource.data;
+      return isVerified()
+        && resource.data.senderId == request.auth.uid
+        && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants
+        && d.diff(resource.data).affectedKeys().hasOnly(['text', 'editedAt'])
+        && shortText(d.text, 1000)
+        && d.text.trim().size() > 0
+        && d.editedAt == request.time;
+    }
+
+    // Deleting your own message stays possible even if you are no longer verified (you can always remove your own words).
+    function canDeleteMessage(conversationId) {
+      return signedIn()
+        && resource.data.senderId == request.auth.uid
+        && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
+    }
+
+    // Edit of the LATEST message: the preview follows the new text (nothing else in the conversation changes).
+    function validPreviewAfterEdit(conversationId) {
+      let d = request.resource.data;
+      return d.diff(resource.data).affectedKeys().hasOnly(['lastMessage'])
+        && resource.data.lastMessageId.matches('^[A-Za-z0-9]{1,64}$')
+        && shortText(d.lastMessage, 1000)
+        && isVerified()
+        && getAfter(/databases/$(database)/documents/conversations/$(conversationId)/messages/$(resource.data.lastMessageId)).data.text == d.lastMessage
+        && getAfter(/databases/$(database)/documents/conversations/$(conversationId)/messages/$(resource.data.lastMessageId)).data.senderId == request.auth.uid;
+    }
+
+    // Delete of the LATEST message: allowed only once that message is gone. The preview then points at a message that
+    // still exists (with updatedAt equal to its createdAt) or becomes empty (updatedAt back to the conversation's start).
+    function validPreviewAfterDelete(conversationId) {
+      let d = request.resource.data;
+      return d.diff(resource.data).affectedKeys().hasOnly(['lastMessage', 'lastMessageId', 'updatedAt'])
+        && resource.data.lastMessageId.matches('^[A-Za-z0-9]{1,64}$')
+        && !existsAfter(/databases/$(database)/documents/conversations/$(conversationId)/messages/$(resource.data.lastMessageId))
+        && ((d.lastMessageId.matches('^[A-Za-z0-9]{1,64}$')
+             && existsAfter(/databases/$(database)/documents/conversations/$(conversationId)/messages/$(d.lastMessageId))
+             && getAfter(/databases/$(database)/documents/conversations/$(conversationId)/messages/$(d.lastMessageId)).data.text == d.lastMessage
+             && getAfter(/databases/$(database)/documents/conversations/$(conversationId)/messages/$(d.lastMessageId)).data.createdAt == d.updatedAt)
+            || (d.lastMessageId == '' && d.lastMessage == '' && d.updatedAt == resource.data.createdAt));
+    }
+
+    // Resubmission of a corrected COR. Only the attestor account (driven by the submit-cor Edge Function, AFTER the new
+    // file was stored) may do this, and only on a profile that is currently "rejected". It reopens the request as
+    // "pending" and clears the old review time and the old attestation, so the new file must be verified again before
+    // an approval is possible. Students cannot change their verification status themselves, ever.
+    function attestorResubmit() {
+      let d = request.resource.data;
+      return isAttestor()
+        && resource.data.verificationStatus == 'rejected'
+        && d.diff(resource.data).affectedKeys().hasOnly(['verificationStatus', 'reviewedAt', 'corVerifiedAt'])
+        && d.verificationStatus == 'pending'
+        && d.reviewedAt == null
+        && d.corVerifiedAt == null;
+    }
+
+    // ---- profile e-mail sync ----
+    // After the student verified a new e-mail through Firebase Authentication, the profile's copy may follow, but ONLY
+    // to exactly the verified e-mail in their token. Nothing else may change in that write.
+    function studentEmailSync(uid) {
+      let d = request.resource.data;
+      return isOwner(uid)
+        && request.auth.token.email_verified == true
+        && d.diff(resource.data).affectedKeys().hasOnly(['email'])
+        && d.email.lower() == request.auth.token.email.lower();
+    }
+
+    // ---- unread-message markers ----
+    // users/{recipient}/unread/{messageId} is ONE tiny document per unread message. It is created by the SENDER in the
+    // same batch as the message itself, and it is what the recipient's Messages badge counts. The marker can only be
+    // created for a message that is being created in this very request (same server time), by that message's sender,
+    // in a conversation both people belong to, and only for the OTHER participant. So nobody can mark an old message
+    // unread again, point a marker at a stranger, or inflate a count without actually sending a message.
+    function validUnreadMarker(recipientId, messageId) {
+      let d = request.resource.data;
+      return messageId.matches('^[A-Za-z0-9]{1,64}$')
+        && d.keys().hasOnly(['conversationId', 'senderId', 'createdAt'])
+        && d.keys().hasAll(['conversationId', 'senderId', 'createdAt'])
+        && d.conversationId is string
+        && d.conversationId.matches('^[A-Za-z0-9_]{1,200}$')
+        && d.senderId == request.auth.uid
+        && d.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/conversations/$(d.conversationId)/messages/$(messageId)).data.senderId == request.auth.uid
+        && getAfter(/databases/$(database)/documents/conversations/$(d.conversationId)/messages/$(messageId)).data.conversationId == d.conversationId
+        && getAfter(/databases/$(database)/documents/conversations/$(d.conversationId)/messages/$(messageId)).data.createdAt == request.time
+        && request.auth.uid in get(/databases/$(database)/documents/conversations/$(d.conversationId)).data.participants
+        && recipientId in get(/databases/$(database)/documents/conversations/$(d.conversationId)).data.participants
+        && recipientId != request.auth.uid
+        && isVerified();
+    }
+
+    // ---- student number changes (administrator review) ----
+    function validStudentNumberRequest(uid) {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['requestedNumber', 'currentNumber', 'status', 'requestedAt', 'reviewedAt'])
+        && d.keys().hasAll(['requestedNumber', 'currentNumber', 'status', 'requestedAt', 'reviewedAt'])
+        && shortText(d.requestedNumber, 30)
+        && d.requestedNumber.matches('^[A-Za-z0-9][A-Za-z0-9 ./_-]{1,28}[A-Za-z0-9]$')
+        && d.currentNumber == get(/databases/$(database)/documents/users/$(uid)).data.studentNumber
+        && d.requestedNumber != d.currentNumber
+        && d.status == 'pending'
+        && d.reviewedAt == null
+        && d.requestedAt == request.time;
+    }
+
+    function validStudentNumberReview() {
+      let d = request.resource.data;
+      return isAdmin()
+        && resource.data.status == 'pending'
+        && d.diff(resource.data).affectedKeys().hasOnly(['status', 'reviewedAt'])
+        && d.status in ['approved', 'rejected']
+        && d.reviewedAt == request.time;
+    }
+
+    // The administrator may change a student's number ONLY in the same write that approves exactly that request.
+    function adminStudentNumberChange(uid) {
+      let d = request.resource.data;
+      return isAdmin()
+        && d.diff(resource.data).affectedKeys().hasOnly(['studentNumber'])
+        && get(/databases/$(database)/documents/studentNumberRequests/$(uid)).data.status == 'pending'
+        && getAfter(/databases/$(database)/documents/studentNumberRequests/$(uid)).data.status == 'approved'
+        && getAfter(/databases/$(database)/documents/studentNumberRequests/$(uid)).data.requestedNumber == d.studentNumber;
+    }
+
+    match /studentNumberRequests/{uid} {
+      allow get: if isOwner(uid) || isAdmin();
+      allow list: if isAdmin();
+      allow create: if isOwner(uid) && validStudentNumberRequest(uid);
+      allow update: if (isOwner(uid) && validStudentNumberRequest(uid)) || validStudentNumberReview();
+      allow delete: if false;
+    }
+
     match /admins/{uid} {
       allow get: if isOwner(uid);           // you can only ask "am I an admin?" about yourself
       allow list, create, update, delete: if false;
@@ -212,7 +361,7 @@ service cloud.firestore {
       allow get: if isOwner(uid) || isAdmin();
       allow list: if isAdmin();
       allow create: if isOwner(uid) && validNewProfile(uid);
-      allow update: if studentEdit(uid) || adminReview() || attestorMark();
+      allow update: if studentEdit(uid) || studentEmailSync(uid) || adminReview() || attestorMark() || attestorResubmit() || adminStudentNumberChange(uid) || studentPhotoChange(uid);
       allow delete: if false;
 
       // Saved listings: private to their owner. Pending and rejected students may save (they can browse).
@@ -225,6 +374,16 @@ service cloud.firestore {
           && request.resource.data.savedAt == request.time
           && exists(/databases/$(database)/documents/listings/$(listingId));
         allow delete: if isOwner(uid);
+      }
+
+      // Unread-message markers: readable only by their owner (the recipient). The recipient deletes them when they open
+      // the conversation ("mark as read"). The SENDER may delete the marker of a message they are deleting. Deleting a
+      // marker that no longer exists changes nothing, so that is allowed too (it reveals nothing). Never updatable.
+      match /unread/{messageId} {
+        allow get, list: if isOwner(uid);
+        allow create: if validUnreadMarker(uid, messageId);
+        allow update: if false;
+        allow delete: if isOwner(uid) || (signedIn() && (resource == null || resource.data.senderId == request.auth.uid));
       }
     }
 
@@ -247,14 +406,16 @@ service cloud.firestore {
       allow list: if signedIn() && request.auth.uid in resource.data.participants;
       allow create: if isVerified() && validNewConversation(conversationId);
       allow update: if signedIn() && request.auth.uid in resource.data.participants
-        && (validOwnNameChange() || validLastMessageUpdate(conversationId));
+        && (validOwnNameChange() || validLastMessageUpdate(conversationId)
+            || validPreviewAfterEdit(conversationId) || validPreviewAfterDelete(conversationId));
       allow delete: if false;
 
       match /messages/{messageId} {
         allow get, list: if signedIn()
           && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
         allow create: if isVerified() && validNewMessage(conversationId, messageId);
-        allow update, delete: if false;
+        allow update: if validMessageEdit(conversationId);
+        allow delete: if canDeleteMessage(conversationId);
       }
     }
 

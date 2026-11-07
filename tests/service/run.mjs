@@ -16,7 +16,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..", "..");
 const out = mkdtempSync(join(tmpdir(), "campuscart-service-tests-"));
 try {
-  const files = ["listingService", "messageService", "firestoreMarketplace", "firebase"].map((name) => join(root, "src", "data", `${name}.ts`));
+  const files = ["listingService", "messageService", "firestoreMarketplace", "firebase", "firebaseAuthService", "navigation", "androidBack", "adminService", "studentNumberService", "avatarService"].map((name) => join(root, "src", "data", `${name}.ts`));
   execFileSync(process.execPath, [join(root, "node_modules", "typescript", "bin", "tsc"), "--ignoreConfig", ...files, "--outDir", out,
     "--module", "esnext", "--target", "es2022", "--moduleResolution", "bundler", "--skipLibCheck", "--lib", "es2022,dom", "--types", "vite/client"],
     { stdio: "inherit", cwd: root });
@@ -29,8 +29,10 @@ try {
   }
   mkdirSync(join(out, "node_modules"), { recursive: true });
   cpSync(join(here, "fake-firebase"), join(out, "node_modules", "firebase"), { recursive: true });
+  mkdirSync(join(out, "node_modules", "@capacitor"), { recursive: true });
+  cpSync(join(here, "fake-capacitor"), join(out, "node_modules", "@capacitor", "core"), { recursive: true });
   let failed = false;
-  for (const test of ["fb-mode.test.mjs", "local-mode.test.mjs"]) {
+  for (const test of ["fb-mode.test.mjs", "local-mode.test.mjs", "navigation.test.mjs", "message-edit.test.mjs", "profile.test.mjs", "unread.test.mjs", "avatar.test.mjs"]) { 
     cpSync(join(here, test), join(out, test));
     console.log(`\n=== ${test} ===`);
     const result = spawnSync(process.execPath, ["--no-warnings", test], { cwd: out, stdio: "inherit" });

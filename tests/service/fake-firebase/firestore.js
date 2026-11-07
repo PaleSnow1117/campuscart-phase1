@@ -34,7 +34,15 @@ export function onSnapshot(target, next, error) {
   if (W.denyRead?.(target)) { queueMicrotask(() => error?.(err("permission-denied"))); return () => W.listeners.delete(l); }
   queueMicrotask(fire); return () => W.listeners.delete(l);
 }
-export async function getDocFromServer(ref) { W.log.push(["getDocFromServer", ref.path]); if (W.offline) throw err("unavailable"); return snapOf(ref.path); }
+// Test controls: W.offline (rejects "unavailable"), W.failCode (rejects with that code), W.hang (never answers),
+// W.delayMs / W.delayByPath (answers late).
+export async function getDocFromServer(ref) {
+  W.log.push(["getDocFromServer", ref.path]);
+  if (W.hang) return new Promise(() => {});
+  const delay = W.delayByPath?.[ref.path] ?? W.delayMs ?? 0; if (delay) await new Promise((r) => setTimeout(r, delay));
+  if (W.offline) throw err("unavailable"); if (W.failCode) throw err(W.failCode);
+  return snapOf(ref.path);
+}
 export async function getDocs(q) { W.log.push(["getDocs", q.path]); if (W.offline) throw err("unavailable"); return { docs: run(q) }; }
 const applyWrite = (op, path, data) => {
   if (W.deny(op, path, data)) throw err("permission-denied");
@@ -51,3 +59,20 @@ export function writeBatch() {
     commit: async () => { W.log.push(["batch", ops.map((o) => [o[0], o[1], o[2]])]); const snapshot = new Map(W.docs); try { for (const o of ops) applyWrite(o[0], o[1], o[2]); } catch (e) { W.docs = snapshot; throw e; } emitAll(); } };
 }
 export const getDoc = async (ref) => getDocFromServer(ref);
+
+// Transactions: reads see the current data (W.beforeTxGet lets a test change data "mid-transaction", like another
+// device would); writes are buffered and applied together, or not at all if one is refused.
+export async function runTransaction(_db, fn) {
+  const writes = [];
+  const tx = {
+    get: async (ref) => { W.log.push(["tx.get", ref.path]); if (W.offline) throw err("unavailable"); W.beforeTxGet?.(ref.path); return snapOf(ref.path); },
+    set: (ref, data) => { writes.push(["set", ref.path, data]); return tx; },
+    update: (ref, data) => { writes.push(["update", ref.path, data]); return tx; },
+    delete: (ref) => { writes.push(["delete", ref.path]); return tx; },
+  };
+  const result = await fn(tx);
+  W.log.push(["transaction", writes.map((w) => [w[0], w[1], w[2]])]);
+  const snapshot = new Map(W.docs);
+  try { for (const w of writes) applyWrite(w[0], w[1], w[2]); } catch (e) { W.docs = snapshot; throw e; }
+  emitAll(); return result;
+}

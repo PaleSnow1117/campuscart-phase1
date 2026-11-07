@@ -39,7 +39,7 @@ export function validateCorFile(file: Pick<File, "name" | "type" | "size"> | nul
   return null;
 }
 
-async function callFunction(name: string, idToken: string, init: RequestInit): Promise<Record<string, unknown>> {
+export async function callFunction(name: string, idToken: string, init: RequestInit): Promise<Record<string, unknown>> {
   let response: Response;
   try {
     response = await fetch(`${functionsUrl}/${name}`, {
@@ -66,6 +66,19 @@ export async function uploadCor(idToken: string, file: File): Promise<string> {
   const body = await callFunction("submit-cor", idToken, { method: "POST", body: form });
   if (typeof body.path !== "string") throw new Error("The upload could not be confirmed. Please try again.");
   return body.path;
+}
+
+/**
+ * Replaces the COR of a REJECTED student. The server stores the new file first and only then reopens the request
+ * ("pending"); if the upload fails nothing changes. Pending and approved students are refused by the server.
+ */
+export async function resubmitCor(idToken: string, file: File): Promise<void> {
+  const invalid = validateCorFile(file);
+  if (invalid) throw new Error(invalid);
+  const form = new FormData();
+  form.append("file", file);
+  const body = await callFunction("submit-cor", idToken, { method: "POST", body: form });
+  if (body.resubmitted !== true) throw new Error("The corrected COR could not be submitted. Please try again.");
 }
 
 /** Removes the file of an unfinished signup. The server refuses once a profile exists. */

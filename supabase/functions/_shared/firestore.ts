@@ -24,6 +24,33 @@ export async function isAdmin(projectId: string, uid: string, idToken: string): 
   throw new UpstreamError(`Unexpected Firestore status ${status}`);
 }
 
+export type ProfileRecord = { exists: false } | { exists: true; status: string | null; updateTime: string | null };
+
+/**
+ * The caller's own profile: whether it exists, its verification status and its updateTime (used as a precondition when
+ * the status is changed). Read with the caller's own token, so the Firestore rules decide what they may see.
+ */
+export async function getProfileRecord(projectId: string, uid: string, idToken: string): Promise<ProfileRecord> {
+  let response: Response;
+  try {
+    response = await fetch(`${base(projectId)}/users/${uid}`, { headers: { Authorization: `Bearer ${idToken}` } });
+  } catch {
+    throw new UpstreamError("Firestore unreachable");
+  }
+  if (response.status === 404) {
+    await response.body?.cancel();
+    return { exists: false };
+  }
+  if (response.status !== 200) {
+    await response.body?.cancel();
+    throw new UpstreamError(`Unexpected Firestore status ${response.status}`);
+  }
+  const document = (await response.json().catch(() => null)) as
+    | { fields?: { verificationStatus?: { stringValue?: string } }; updateTime?: string }
+    | null;
+  return { exists: true, status: document?.fields?.verificationStatus?.stringValue ?? null, updateTime: document?.updateTime ?? null };
+}
+
 /** Whether the caller's own profile document exists. */
 export async function profileExists(projectId: string, uid: string, idToken: string): Promise<boolean> {
   const status = await statusOf(projectId, `users/${uid}`, idToken);

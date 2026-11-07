@@ -33,7 +33,7 @@ export function verificationNotice(user: User): string {
     return "Your account is pending student verification. You can browse and save items, but listing and messaging unlock once your Certificate of Registration is approved.";
   }
   if (user.verificationStatus === "rejected") {
-    return "Your student verification was not approved, so listing and messaging are unavailable. Resubmitting will be available in a later update.";
+    return "Your student verification was not approved, so listing and messaging are unavailable. You can upload a corrected Certificate of Registration on your Profile page.";
   }
   return "";
 }

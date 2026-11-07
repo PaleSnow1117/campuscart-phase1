@@ -1,5 +1,6 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { requireEnv } from "./errors.ts";
+import { AVATAR_BUCKET } from "./avatar.ts";
 import { COR_BUCKET } from "./validate.ts";
 
 // Uses the service-role key that the Supabase platform injects into Edge Functions as an environment
@@ -9,4 +10,12 @@ export function corBucket() {
     auth: { persistSession: false, autoRefreshToken: false },
   });
   return client.storage.from(COR_BUCKET);
+}
+
+// Same service-role client, pointed at the PUBLIC profile-pictures bucket. Only Edge Functions ever write to it.
+export function avatarBucket() {
+  const client = createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_ROLE_KEY"), {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  return client.storage.from(AVATAR_BUCKET);
 }

@@ -16,6 +16,10 @@ export type User = {
   verifiedAt?: string | null;
   /** When the administrator approved or rejected the request. */
   reviewedAt?: string | null;
+  /** Storage path of the profile picture in the public profile-pictures bucket ("{uid}/avatar"), or null when there is none. */
+  photoPath?: string | null;
+  /** When the picture last changed. Only used to refresh cached copies of it; never shown. */
+  photoUpdatedAt?: string | null;
 };
 
 export const DEFAULT_CAMPUS = "URS Binangonan";
@@ -86,6 +90,14 @@ export type Message = {
   senderId: string;
   text: string;
   createdAt: string;
+  /** Set when the sender edited the message (shown as "edited"). */
+  editedAt?: string | null;
+};
+
+/** One unread incoming message of the signed-in user. The badge counts these; a message appears at most once. */
+export type UnreadEntry = {
+  messageId: string;
+  conversationId: string;
 };
 
 /** Stops a live subscription. */
