@@ -1,6 +1,6 @@
 import { isFirebaseConfigured } from "./firebase";
 import { firestoreListings, firestoreSaved } from "./firestoreMarketplace";
-import { formatSellerName } from "./listingHelpers";
+import { formatSellerName, isSold } from "./listingHelpers";
 import { localBus } from "./localBus";
 import {
   getSavedIds,
@@ -23,7 +23,7 @@ import type {
 // localStorage prototype below keeps working, including its demo listings. The two are never mixed.
 
 // The pure helpers moved to listingHelpers.ts; they are re-exported so existing imports keep working.
-export { artKind, formatPostedAt, formatPrice, formatSellerName, parsePrice } from "./listingHelpers";
+export { artKind, formatPostedAt, formatPrice, formatSellerName, isSold, parsePrice } from "./listingHelpers";
 
 type OnError = (error: unknown) => void;
 
@@ -31,6 +31,7 @@ type ListingBackend = {
   subscribe(onData: (items: Listing[]) => void, onError: OnError): Unsubscribe;
   create(input: NewListingInput, seller: User): Promise<Listing>;
   update(id: string, input: NewListingInput, user: User): Promise<void>;
+  markSold(id: string, user: User | null): Promise<void>;
   remove(id: string, user: User): Promise<void>;
   syncSellerName(user: User): Promise<void>;
 };
@@ -105,7 +106,7 @@ const localListings: ListingBackend = {
       id: makeId(), title, description,
       price: input.price, condition: input.condition, category: input.category,
       sellerId: seller.id, sellerName: formatSellerName(seller.fullName),
-      images: input.images, campus: seller.campus, createdAt: new Date().toISOString(),
+      images: input.images, campus: seller.campus, createdAt: new Date().toISOString(), status: "available",
     };
     try {
       saveStoredListings([listing, ...readLocalListings()]);
@@ -134,6 +135,17 @@ const localListings: ListingBackend = {
     } catch {
       throw new Error("Not enough browser storage for these photos. Try fewer or smaller photos.");
     }
+    localBus.notify();
+  },
+
+  /** Mark as Sold: only the owner, only an available listing. Everything else about the listing stays as it was. */
+  async markSold(id, user) {
+    if (!user) throw new Error("Please log in to mark an item as sold.");
+    const all = readLocalListings();
+    const current = all.find((listing) => listing.id === id);
+    if (!current || current.sellerId !== user.id) throw new Error("You can only mark your own listings as sold.");
+    if (isSold(current)) throw new Error("This item is already marked as sold.");
+    saveStoredListings(all.map((listing) => (listing.id === id ? { ...listing, status: "sold" } : listing)));
     localBus.notify();
   },
 
@@ -184,6 +196,8 @@ export const listingService = {
   subscribe: backend.subscribe,
   create: backend.create,
   update: backend.update,
+  /** Mark as Sold (owner only). The listing stays in Saved finds and in existing conversations, labelled SOLD. */
+  markSold: backend.markSold,
   remove: backend.remove,
   syncSellerName: backend.syncSellerName,
 
@@ -192,10 +206,11 @@ export const listingService = {
     return listings.filter((listing) => listing.sellerId === sellerId);
   },
 
-  /** Pure filter so UI components stay free of matching logic. */
-  filter(listings: Listing[], { category = "All", query = "" }: ListingFilters): Listing[] {
+  /** Pure filter so UI components stay free of matching logic. Sold items are left out unless `status` asks for them. */
+  filter(listings: Listing[], { category = "All", query = "", status = "available" }: ListingFilters): Listing[] {
     const text = query.toLowerCase().trim();
     return listings.filter((listing) => {
+      if (status !== "all" && (status === "sold") !== isSold(listing)) return false;
       if (category !== "All" && listing.category !== category) return false;
       return !text || [listing.title, listing.condition, listing.sellerName, listing.category, listing.description]
         .some((field) => field.toLowerCase().includes(text));

@@ -19,7 +19,7 @@ import {
   type DocumentReference,
 } from "firebase/firestore";
 import { getFirebase } from "./firebase";
-import { formatSellerName } from "./listingHelpers";
+import { formatSellerName, isSold } from "./listingHelpers";
 import {
   LISTING_CATEGORIES,
   LISTING_CONDITIONS,
@@ -83,6 +83,7 @@ export function toListing(id: string, data: DocumentData): Listing | null {
     images: Array.isArray(data.images) ? data.images.filter((entry): entry is string => typeof entry === "string") : [],
     campus: text(data.campus),
     createdAt: toIso(data.createdAt),
+    status: data.status === "sold" ? "sold" : "available",
   };
 }
 
@@ -170,11 +171,12 @@ export const firestoreListings = {
       sellerId: seller.id,
       sellerName,
       campus: seller.campus,
+      status: "available",
       createdAt: serverTimestamp(),
     });
     return {
       id: ref.id, title, description, price: input.price, condition: input.condition, category: input.category,
-      images: input.images, sellerId: seller.id, sellerName, campus: seller.campus, createdAt: new Date().toISOString(),
+      images: input.images, sellerId: seller.id, sellerName, campus: seller.campus, createdAt: new Date().toISOString(), status: "available",
     };
   },
 
@@ -186,6 +188,15 @@ export const firestoreListings = {
     await updateDoc(doc(db, "listings", id), {
       title, description, price: input.price, condition: input.condition, category: input.category, images: input.images,
     });
+  },
+
+  /**
+   * Mark as Sold: writes ONLY status = "sold". The rules allow it only for the listing's owner, only from available
+   * to sold, and only that one field, so nobody else can mark someone's item as sold.
+   */
+  async markSold(id: string, user: User | null): Promise<void> {
+    requireVerified(user, "Please log in to mark an item as sold.");
+    await updateDoc(doc(getFirebase().db, "listings", id), { status: "sold" });
   },
 
   async remove(id: string, user: User | null): Promise<void> {
@@ -306,8 +317,9 @@ export const firestoreMessages = {
     const existing = await getDocFromServer(ref);
     if (existing.exists()) {
       const found = toConversation(existing.id, existing.data());
-      if (found) return found;
+      if (found) return found; // an existing conversation stays available, even after the item was sold
     }
+    if (isSold(listing)) throw new Error("This item has been sold.");
     const buyerName = formatSellerName(signedIn.fullName);
     try {
       await setDoc(ref, {

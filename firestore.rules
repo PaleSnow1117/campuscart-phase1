@@ -135,10 +135,11 @@ service cloud.firestore {
       let d = request.resource.data;
       return listingId.matches('^[A-Za-z0-9]{1,64}$')
         && d.keys().hasOnly(['title', 'price', 'condition', 'category', 'description', 'sellerId',
-                             'sellerName', 'images', 'campus', 'createdAt'])
+                             'sellerName', 'images', 'campus', 'createdAt', 'status'])
         && d.keys().hasAll(['title', 'price', 'condition', 'category', 'description', 'sellerId',
                             'sellerName', 'images', 'campus', 'createdAt'])
         && validListingFields(d)
+        && (!('status' in d) || d.status == 'available')
         && d.sellerId == request.auth.uid
         && nameMatchesProfile(d.sellerName)
         && d.campus == userProfile().campus
@@ -154,6 +155,16 @@ service cloud.firestore {
         && (d.sellerName == resource.data.sellerName || nameMatchesProfile(d.sellerName));
     }
 
+    // Mark as Sold. `status` is 'available' or 'sold'; listings created before this field existed have none and count
+    // as available. The owner may change ONLY status, and only from available to sold (one way). validListingEdit does
+    // not list status, so a normal edit can never change it. The owner check is in the listings match below.
+    function validMarkSold() {
+      let d = request.resource.data;
+      return d.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && d.status == 'sold'
+        && resource.data.get('status', 'available') == 'available';
+    }
+
     // ---- conversations and messages ----
     // The conversation id is listingId_buyerUid, so there can only ever be ONE conversation per listing and
     // buyer, and the seller is always the listing's own seller (taken from the listing, never from the client).
@@ -166,6 +177,7 @@ service cloud.firestore {
                             'sellerName', 'participants', 'lastMessage', 'lastMessageId', 'createdAt', 'updatedAt'])
         && conversationId == d.listingId + '_' + d.buyerId
         && d.buyerId == request.auth.uid
+        && listing.get('status', 'available') == 'available'
         && d.sellerId == listing.sellerId
         && d.sellerId != d.buyerId
         && d.listingTitle == listing.title
@@ -392,7 +404,7 @@ service cloud.firestore {
     match /listings/{listingId} {
       allow get, list: if signedIn();
       allow create: if isVerified() && validNewListing(listingId);
-      allow update: if signedIn() && resource.data.sellerId == request.auth.uid && isVerified() && validListingEdit();
+      allow update: if signedIn() && resource.data.sellerId == request.auth.uid && isVerified() && (validListingEdit() || validMarkSold());
       allow delete: if signedIn() && resource.data.sellerId == request.auth.uid;
     }
 

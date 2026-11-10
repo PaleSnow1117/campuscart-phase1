@@ -32,7 +32,7 @@ try {
   mkdirSync(join(out, "node_modules", "@capacitor"), { recursive: true });
   cpSync(join(here, "fake-capacitor"), join(out, "node_modules", "@capacitor", "core"), { recursive: true });
   let failed = false;
-  for (const test of ["fb-mode.test.mjs", "local-mode.test.mjs", "navigation.test.mjs", "message-edit.test.mjs", "profile.test.mjs", "unread.test.mjs", "avatar.test.mjs"]) { 
+  for (const test of ["fb-mode.test.mjs", "local-mode.test.mjs", "navigation.test.mjs", "message-edit.test.mjs", "profile.test.mjs", "unread.test.mjs", "avatar.test.mjs", "sold.test.mjs"]) { 
     cpSync(join(here, test), join(out, test));
     console.log(`\n=== ${test} ===`);
     const result = spawnSync(process.execPath, ["--no-warnings", test], { cwd: out, stdio: "inherit" });

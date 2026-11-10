@@ -1,8 +1,13 @@
-import type { ListingCategory } from "./types";
+import type { Listing, ListingCategory } from "./types";
 
 // Pure helpers shared by the local and Firestore listing backends. They live in their own file so the
 // Firestore module can use them without importing listingService (which would create an import cycle).
 // listingService.ts re-exports all of them, so existing imports keep working.
+
+/** True once the seller marked the listing as sold. Listings without a status are available. */
+export function isSold(listing: Pick<Listing, "status">): boolean {
+  return listing.status === "sold";
+}
 
 /** "Juan Dela Cruz" -> "Juan C." to match the existing card style. */
 export function formatSellerName(fullName: string): string {

@@ -75,4 +75,21 @@ await t("local mode: unread markers follow send / read / delete, per user, and s
   [sellerBox, buyerBox, fresh, msgs].forEach((s) => s.off()); });
 await t("local mode: there are no profile-picture addresses (pictures need an online account), so every avatar shows initials", async () => {
   const { avatarUrl } = await import("./avatarService.js"); assert.equal(avatarUrl("anyuid"), null); assert.equal(avatarUrl("anyuid", "2026-01-01T00:00:00Z"), null); });
+// ---- Mark as Sold in local mode ----
+await t("local mode: only the owner can mark an available listing as sold; it is one-way and stays in My listings / Saved", async () => {
+  const owner = U("so1"), buyer = U("sb1"); const { box, off } = latest(listingService.subscribe); await tick();
+  const made = await listingService.create(input({ title: "Sellable" }), owner); await tick(); assert.equal(box.value.find((l) => l.id === made.id).status, "available");
+  await assert.rejects(listingService.markSold(made.id, buyer), /only mark your own/i); await assert.rejects(listingService.markSold(made.id, null), /log in/i); await assert.rejects(listingService.markSold("nope", owner), /only mark your own/i);
+  assert.equal(box.value.find((l) => l.id === made.id).status, "available", "a refused attempt changes nothing");
+  await savedService.set("sb1", made.id, true);
+  await listingService.markSold(made.id, owner); await tick(); const sold = box.value.find((l) => l.id === made.id); assert.equal(sold.status, "sold"); assert.equal(sold.title, "Sellable"); assert.equal(sold.sellerId, "so1");
+  await assert.rejects(listingService.markSold(made.id, owner), /already marked/i);
+  assert.ok(listingService.forSeller(box.value, "so1").some((l) => l.id === made.id), "still in My listings"); const savedBox = latest(savedService.subscribe, "sb1"); await tick(); assert.ok(savedBox.box.value.includes(made.id), "still in Saved finds"); savedBox.off();
+  assert.ok(!listingService.filter(box.value, {}).some((l) => l.id === made.id), "gone from the available catalog"); assert.ok(listingService.filter(box.value, { status: "sold" }).some((l) => l.id === made.id), "visible in the sold view");
+  off(); });
+await t("local mode: nobody can start a NEW chat about a sold item, but an existing chat stays", async () => {
+  const owner = U("so2"), early = U("sb2"), late = U("sb3"); const made = await listingService.create(input({ title: "Gone soon" }), owner);
+  const chat = await messageService.getOrCreateConversation(made, early); await messageService.send(chat.id, early, "hi"); await listingService.markSold(made.id, owner);
+  const sold = { ...made, status: "sold" }; await assert.rejects(messageService.getOrCreateConversation(sold, late), /has been sold/i);
+  assert.equal((await messageService.getOrCreateConversation(sold, early)).id, chat.id, "existing conversation preserved"); await messageService.send(chat.id, owner, "sorry, sold"); });
 console.log(`\n${passed} passed`);

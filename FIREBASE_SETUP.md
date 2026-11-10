@@ -260,10 +260,24 @@ npm.cmd run build
 npm.cmd run lint
 node tests/service/run.mjs
 node tests/functions/run.mjs
-npx.cmd firebase-tools emulators:exec --only firestore --project demo-campuscart "node rules-tests/firestore.rules.test.mjs && node rules-tests/marketplace.rules.test.mjs && node rules-tests/profile-and-messages.rules.test.mjs && node rules-tests/avatar-and-unread.rules.test.mjs"
+npx.cmd firebase-tools emulators:exec --only firestore --project demo-campuscart "node rules-tests/firestore.rules.test.mjs && node rules-tests/marketplace.rules.test.mjs && node rules-tests/profile-and-messages.rules.test.mjs && node rules-tests/avatar-and-unread.rules.test.mjs && node rules-tests/sold.rules.test.mjs"
 ```
 
 ### Notes
 - Messages that were sent before this update have no unread marker, so they are never counted as unread (the badge starts at zero for old conversations).
 - Messages sent from an old app version (before updating) do not create a marker, so the recipient's badge will not count them.
 - Other students see a changed picture after the browser cache expires (up to 5 minutes). The owner sees it immediately.
+
+
+## Mark as Sold
+
+- **Field**: `listings/{id}.status` is `"available"` or `"sold"`. Listings created before this feature have no `status` and count as available, so nothing needs migrating. There is only this one status field.
+- **How it works**: in Profile > My listings the seller taps **Mark as Sold** and confirms. Only `status` is written, and only from available to sold (it cannot be undone). The listing then shows a red **SOLD** label on its card and detail page, disappears from the Home catalog and search (a **Sold** chip on Home shows sold items separately), stays in the seller's My listings and in buyers' Saved finds (labelled SOLD), and shows a disabled "Sold" button instead of "Message seller".
+- **Conversations**: a conversation that already exists is kept, and both people can keep messaging. Nobody can start a NEW conversation about a sold item.
+- **Rules** (`firestore.rules`): the owner may change only `status`, and only to `"sold"` from available (`validMarkSold`); new listings must start available (or have no status); `validNewConversation` refuses sold listings. Nobody else can change a listing's status.
+
+### Deployment
+Only the Firestore rules and the app need deploying (no Edge Function or Supabase change). Rules FIRST: the new app writes `status: "available"` when it creates a listing, which the old rules would refuse.
+
+1. `npx.cmd firebase-tools deploy --only firestore:rules`
+2. Build and release the web app / Android APK as usual.

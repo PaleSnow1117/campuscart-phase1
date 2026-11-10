@@ -39,6 +39,9 @@ export const CAMPUSES = [
 /** The parts of a User that can be edited from the Profile screens. */
 export type ProfileChanges = Partial<Pick<User, "fullName" | "username" | "email" | "campus">>;
 
+/** Mark as Sold. Listings created before this field existed have no status and count as available. */
+export type ListingStatus = "available" | "sold";
+
 export type Listing = {
   id: string;
   title: string;
@@ -53,6 +56,8 @@ export type Listing = {
   images: string[];
   campus: string;
   createdAt: string;
+  /** "sold" once the seller marked it as sold. Missing means available. Use isSold() from listingService. */
+  status?: ListingStatus;
 };
 
 export type NewListingInput = {
@@ -67,6 +72,8 @@ export type NewListingInput = {
 export type ListingFilters = {
   category?: ListingCategory | "All";
   query?: string;
+  /** Default "available": sold items are left out. "sold" shows only sold items, "all" shows both. */
+  status?: ListingStatus | "all";
 };
 
 export type Conversation = {

@@ -1,6 +1,6 @@
 import { isFirebaseConfigured } from "./firebase";
 import { firestoreMessages } from "./firestoreMarketplace";
-import { formatSellerName } from "./listingHelpers";
+import { formatSellerName, isSold } from "./listingHelpers";
 import { localBus } from "./localBus";
 import type { Conversation, Listing, Message, UnreadEntry, Unsubscribe, User } from "./types";
 import { canUseMarketplace, verificationNotice } from "./verification";
@@ -144,7 +144,8 @@ const localBackend: MessageBackend = {
         conversation.sellerId === listing.sellerId &&
         conversation.listingId === listing.id,
     );
-    if (existing) return existing;
+    if (existing) return existing; // an existing conversation stays available, even after the item was sold
+    if (isSold(listing)) throw new Error("This item has been sold.");
     const now = new Date().toISOString();
     const conversation: Conversation = {
       id: makeId("conv"),

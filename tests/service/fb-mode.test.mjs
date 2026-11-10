@@ -32,7 +32,7 @@ await t("1. create: writes ONE listing doc; seller, name and campus come from th
   const l = await listingService.create(input({ title: "  Calc  " }), U("A", "approved", "Ana Reyes", "URS Tanay"));
   const [w] = writes(); assert.equal(w[0], "setDoc"); assert.match(w[1], /^listings\/AUTO\d+$/); const d = w[2];
   assert.equal(d.sellerId, "A"); assert.equal(d.sellerName, "Ana R."); assert.equal(d.campus, "URS Tanay"); assert.equal(d.title, "Calc"); assert.ok(d.createdAt.__serverTimestamp);
-  assert.deepEqual(Object.keys(d).sort(), ["campus", "category", "condition", "createdAt", "description", "images", "price", "sellerId", "sellerName", "title"]);
+  assert.deepEqual(Object.keys(d).sort(), ["campus", "category", "condition", "createdAt", "description", "images", "price", "sellerId", "sellerName", "status", "title"]); assert.equal(d.status, "available", "new listings start as available");
   assert.equal(l.sellerId, "A"); assert.equal(writes().length, 1); });
 await t("create ignores any client-supplied owner (the input has no sellerId field; the user decides)", async () => { await listingService.create({ ...input(), sellerId: "EVIL", campus: "EVIL" }, U("A")); const d = writes()[0][2]; assert.equal(d.sellerId, "A"); assert.notEqual(d.campus, "EVIL"); });
 await t("6. pending/rejected/signed-out users are stopped before ANY write", async () => { for (const u of [U("P", "pending"), U("R", "rejected")]) await assert.rejects(listingService.create(input(), u), /verification|pending|approved/i); await assert.rejects(listingService.create(input(), null), /log in/i); await assert.rejects(listingService.update("L1", input(), U("P", "pending")), /verification|pending|approved/i); assert.equal(writes().length, 0); });
